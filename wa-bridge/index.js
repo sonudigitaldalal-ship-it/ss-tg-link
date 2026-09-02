@@ -201,6 +201,23 @@ app.get("/debug-chats", checkApiKey, async (req, res) => {
   }
 });
 
+// TEMPORARY — bina API key ke browser mein seedha kholne ke liye.
+// Diagnose hone ke baad ye endpoint hata dena (security ke liye).
+app.get("/debug-chats-open", async (req, res) => {
+  if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
+  try {
+    const chats = await client.getChats();
+    const all = chats.map((c) => ({
+      name: c.name,
+      isGroup: c.isGroup,
+      id: c.id._serialized,
+    }));
+    res.json({ total: all.length, chats: all });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Image kisi group mein bhejo
 app.post("/send", checkApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
