@@ -80,6 +80,14 @@ async function notifyTelegram(text) {
 // ── WhatsApp Client Setup ──────────────────────────────
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: SESSION_PATH }),
+  // WhatsApp Web ke latest frontend updates se whatsapp-web.js library kabhi-kabhi
+  // break ho jati hai (jaise abhi "getChats" fail ho raha tha). Isko ek stable,
+  // known-working version pe lock karke fix karte hain.
+  webVersionCache: {
+    type: "remote",
+    remotePath:
+      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023950759.html",
+  },
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
