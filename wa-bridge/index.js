@@ -23,9 +23,59 @@ app.use(express.json({ limit: "20mb" })); // images base64 mein bade ho sakte ha
 const API_KEY = process.env.WA_API_KEY || "";
 const PORT = process.env.PORT || 3000;
 const SESSION_PATH = process.env.SESSION_PATH || "/data/wwebjs_auth";
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const AUTHORIZED_USERS = (process.env.AUTHORIZED_USERS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 let latestQr = null;
 let isReady = false;
+
+// Naya QR aane par seedha Telegram bot ke through photo bhejo
+// (taaki Railway browser kholne ki zaroorat na pade)
+async function sendQrToTelegram(qr) {
+  if (!BOT_TOKEN || AUTHORIZED_USERS.length === 0) {
+    console.log("⚠️ BOT_TOKEN ya AUTHORIZED_USERS set nahi hai, QR sirf /qr page par milega.");
+    return;
+  }
+  try {
+    const qrBuffer = await qrcode.toBuffer(qr, { width: 400 });
+    for (const userId of AUTHORIZED_USERS) {
+      const form = new FormData();
+      form.append("chat_id", userId);
+      form.append(
+        "caption",
+        "📱 WhatsApp se scan karo:\nSettings → Linked Devices → Link a Device"
+      );
+      form.append("photo", new Blob([qrBuffer], { type: "image/png" }), "qr.png");
+      const resp = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+        method: "POST",
+        body: form,
+      });
+      if (!resp.ok) {
+        console.log("⚠️ Telegram ko QR bhejne mein error:", await resp.text());
+      }
+    }
+    console.log("📤 QR code Telegram bot ke through bhej diya.");
+  } catch (e) {
+    console.log("⚠️ QR Telegram pe bhejne mein fail:", e.message);
+  }
+}
+
+// Simple text notification (ready/disconnected events ke liye)
+async function notifyTelegram(text) {
+  if (!BOT_TOKEN || AUTHORIZED_USERS.length === 0) return;
+  for (const userId of AUTHORIZED_USERS) {
+    try {
+      await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: userId, text }),
+      });
+    } catch (e) {
+      console.log("⚠️ Telegram notify fail:", e.message);
+    }
+  }
+}
 
 // ── WhatsApp Client Setup ──────────────────────────────
 const client = new Client({
@@ -45,18 +95,21 @@ const client = new Client({
 client.on("qr", (qr) => {
   latestQr = qr;
   isReady = false;
-  console.log("📱 Naya QR code aaya! /qr endpoint browser mein kholo aur scan karo.");
+  console.log("📱 Naya QR code aaya! Telegram bot pe bhej raha hoon...");
+  sendQrToTelegram(qr);
 });
 
 client.on("ready", () => {
   isReady = true;
   latestQr = null;
   console.log("✅ WhatsApp connected aur ready hai!");
+  notifyTelegram("✅ WhatsApp connect ho gaya! Ab /wagroup try kar sakte ho.");
 });
 
 client.on("disconnected", (reason) => {
   isReady = false;
   console.log("⚠️ WhatsApp disconnect ho gaya:", reason);
+  notifyTelegram(`⚠️ WhatsApp disconnect ho gaya (${reason}). Naya QR generate hoga.`);
 });
 
 client.initialize();
