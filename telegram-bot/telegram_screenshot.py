@@ -1,6 +1,11 @@
 """
-Telegram Search Bot
-====================
+Telegram Search Bot — Bot API version (no OTP/session needed)
+================================================================
+Ye bot ko apne saare deal-channels mein ADMIN banao (member se nahi chalega).
+Jab se add hoga, tab se har naya post automatically database mein save hota
+rahega. Search usi database mein hota hai — Telegram history API se nahi,
+isliye add hone SE PEHLE ka purana data isme nahi milega.
+
 Commands:
     /start            → welcome + all commands
     /help             → same as /start
@@ -8,7 +13,7 @@ Commands:
     /a <keyword>      → search Plan A
     /b <keyword>      → search Plan B
     /c <keyword>      → search Plan C
-    /debug            → check channel name matching
+    /debug            → check which channels bot has seen posts from
 """
 
 import asyncio
@@ -18,23 +23,21 @@ import threading
 import re
 import base64
 import logging
-import threading
+import sqlite3
+import subprocess
 from io import BytesIO
-from datetime import timezone, timedelta
+from datetime import timezone, timedelta, datetime
 
-from telethon import TelegramClient
-from telethon.tl.types import Channel, Chat
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
-import subprocess, sys, os
+import os
 
 # Auto-install chromium with all deps on Railway
 def ensure_chromium():
     try:
-        import subprocess
         result = subprocess.run(
             ["playwright", "install", "chromium", "--with-deps"],
             capture_output=True, text=True
@@ -49,16 +52,14 @@ def ensure_chromium():
 ensure_chromium()
 
 # ─────────────────────────────────────────────
-#  STEP 1 — Your Telegram login credentials
+#  STEP 1 — Bot credentials
 # ─────────────────────────────────────────────
-API_ID        = int(os.environ["API_ID"])
-API_HASH      = os.environ["API_HASH"]
-PHONE         = os.environ["PHONE"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
-YOUR_USER_ID  = [int(x.strip()) for x in os.environ.get("AUTHORIZED_USERS","").split(",") if x.strip()]
+YOUR_USER_ID  = [int(x.strip()) for x in os.environ.get("AUTHORIZED_USERS", "").split(",") if x.strip()]
 
 # ─────────────────────────────────────────────
 #  STEP 2 — Define your channels
+#  (name must match exactly what the bot sees as chat.title once added)
 # ─────────────────────────────────────────────
 CH1  = ("Trending Loot Deals",                        "https://telegram.me/+CmTgiyYxFC0zMjg1")
 CH2  = ("Deals Point",                                "https://telegram.me/+KgUrCwnDny02ZDk1")
@@ -78,29 +79,87 @@ PLAN_A = [CH1, CH2, CH5, CH10]
 PLAN_B = [CH1, CH2, CH5, CH10, CH7, CH3, CH4]
 PLAN_C = [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8, CH9]
 
-# ─────────────────────────────────────────────
-#  STEP 4 — Save (Ctrl+S) and run
-# ─────────────────────────────────────────────
-
-MAX_RESULTS  = 1
 SEARCH_HOURS = 12   # only search posts from last X hours
 IST          = timezone(timedelta(hours=5, minutes=30))
-PLANS       = {"A": PLAN_A, "B": PLAN_B, "C": PLAN_C}
+PLANS        = {"A": PLAN_A, "B": PLAN_B, "C": PLAN_C}
 
-# Photo cache — stores channel photos so we don't re-download every search
-photo_cache: dict = {}
+# ─────────────────────────────────────────────
+#  DATABASE — stores every channel post the bot sees, once added as admin
+# ─────────────────────────────────────────────
+DB_PATH = os.environ.get("DB_PATH", "/data/messages.db")
 
-# ─── WhatsApp API Config ──────────────────────────────────
+def db_init():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            chat_id     INTEGER,
+            chat_title  TEXT,
+            username    TEXT,
+            message_id  INTEGER,
+            text        TEXT,
+            date_utc    TEXT,
+            PRIMARY KEY (chat_id, message_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS channels (
+            chat_id     INTEGER PRIMARY KEY,
+            chat_title  TEXT,
+            username    TEXT,
+            photo_b64   TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_save_message(chat_id, chat_title, username, message_id, text, date_utc):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO messages (chat_id, chat_title, username, message_id, text, date_utc) VALUES (?,?,?,?,?,?)",
+        (chat_id, chat_title, username, message_id, text, date_utc.isoformat())
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO channels (chat_id, chat_title, username, photo_b64) VALUES (?,?,?, COALESCE((SELECT photo_b64 FROM channels WHERE chat_id=?), ''))",
+        (chat_id, chat_title, username, chat_id)
+    )
+    conn.commit()
+    conn.close()
+
+def db_update_photo(chat_id, photo_b64):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE channels SET photo_b64=? WHERE chat_id=?", (photo_b64, chat_id))
+    conn.commit()
+    conn.close()
+
+def db_get_known_channels():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT chat_id, chat_title, username, photo_b64 FROM channels").fetchall()
+    conn.close()
+    return rows
+
+def db_search(chat_title: str, keyword: str, cutoff_utc: datetime):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT chat_id, username, message_id, text, date_utc FROM messages "
+        "WHERE chat_title = ? COLLATE NOCASE AND text LIKE ? AND date_utc >= ? "
+        "ORDER BY date_utc DESC LIMIT 1",
+        (chat_title, f"%{keyword}%", cutoff_utc.isoformat())
+    ).fetchone()
+    conn.close()
+    return row
+
+# ── WhatsApp API Config ──────────────────────────────────
 WA_API_URL = os.environ.get('WA_API_URL', '').rstrip('/')
 WA_API_KEY = os.environ.get('WA_API_KEY', '')
 
 # ── WhatsApp State ────────────────────────────────────────
-user_wa_group = {}   # user_id → {'id': ..., 'name': ...}
-pending_send  = {}   # cb_id → {img_b64, caption, group_id, group_name}
-sent_wa       = {}   # cb_id → {key, group_id}
+user_wa_group = {}
+pending_send  = {}
+sent_wa       = {}
 
 # ── Plan → WA Group mapping (persistent) ─────────────────
-PLAN_GROUPS_FILE = '/data/plan_groups.json'
+PLAN_GROUPS_FILE = os.environ.get("PLAN_GROUPS_FILE", "/data/plan_groups.json")
 
 def load_plan_groups():
     import json
@@ -108,9 +167,9 @@ def load_plan_groups():
         if os.path.exists(PLAN_GROUPS_FILE):
             with open(PLAN_GROUPS_FILE, 'r') as f:
                 return json.load(f)
-    except:
+    except Exception:
         pass
-    return {}  # {'A': {'id': ..., 'name': ...}, 'B': {...}, 'C': {...}}
+    return {}
 
 def save_plan_groups(data):
     import json
@@ -120,9 +179,8 @@ def save_plan_groups(data):
     except Exception as e:
         log.error(f'save_plan_groups: {e}')
 
-plan_wa_groups = load_plan_groups()  # Plan → WA group mapping
+plan_wa_groups = load_plan_groups()
 
-# ── WhatsApp API helpers ──────────────────────────────────
 def wa_headers():
     return {'x-api-key': WA_API_KEY, 'Content-Type': 'application/json'}
 
@@ -147,25 +205,6 @@ def wa_delete(group_id, key):
         json={'groupId': group_id, 'key': key}, timeout=10)
     return r.json().get('success', False)
 
-
-# Photo cache — stores channel photos so we don't re-download every search
-photo_cache: dict = {}
-
-
-
-
-# ── Telethon on its own loop ──────────────────
-telethon_loop   = asyncio.new_event_loop()
-telethon_client: TelegramClient = None
-
-def run_telethon_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-def telethon_run(coro):
-    return asyncio.run_coroutine_threadsafe(coro, telethon_loop).result(timeout=120)
-
-
 # ── Helpers ───────────────────────────────────
 
 def to_ist(dt) -> str:
@@ -187,24 +226,33 @@ COLORS = ["#1565C0","#6A1B9A","#2E7D32","#AD1457",
 def avatar_color(name: str) -> str:
     return COLORS[sum(ord(c) for c in name) % len(COLORS)]
 
+# ── Fetch channel profile photo (Bot API) ─────
 
-# ── Fetch channel profile photo ───────────────
+bot_instance = None  # set in main()
 
-async def get_photo_b64(entity) -> str:
-    key = str(entity.id)
-    if key in photo_cache:
-        return photo_cache[key]   # return cached photo instantly
+async def refresh_photo_if_needed(chat_id: int, chat_title: str):
+    known = {row[0]: row[3] for row in db_get_known_channels()}
+    if known.get(chat_id):
+        return
     try:
-        photo_bytes = await telethon_client.download_profile_photo(entity, file=bytes)
-        if photo_bytes:
-            result = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
-            photo_cache[key] = result
-            return result
+        chat = await bot_instance.get_chat(chat_id)
+        if chat.photo:
+            file = await bot_instance.get_file(chat.photo.small_file_id)
+            data = await file.download_as_bytearray()
+            b64 = "data:image/jpeg;base64," + base64.b64encode(bytes(data)).decode()
+            db_update_photo(chat_id, b64)
     except Exception as e:
-        log.warning(f"Photo fetch failed: {e}")
-    photo_cache[key] = ""   # cache empty result too so we don't retry
-    return ""
+        log.warning(f"Photo fetch failed for {chat_title}: {e}")
 
+# ── Channel post listener — this is what replaces Telethon ────
+
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if not msg or not msg.text:
+        return
+    chat = msg.chat
+    db_save_message(chat.id, chat.title or "", chat.username or "", msg.message_id, msg.text, msg.date)
+    asyncio.create_task(refresh_photo_if_needed(chat.id, chat.title or ""))
 
 # ── HTML builder ──────────────────────────────
 
@@ -217,7 +265,6 @@ def build_html(results: list, keyword: str, plan: str) -> str:
         name  = m["channel"]
         found = m.get("found", False)
 
-        # ── Avatar: real photo or colored initials ──
         photo = m.get("photo_b64", "")
         if photo:
             avatar_html = f'<img class="avatar-img" src="{photo}" alt="{name}"/>'
@@ -248,7 +295,6 @@ def build_html(results: list, keyword: str, plan: str) -> str:
             </div>
             <div class="divider"></div>"""
         else:
-            # Not posted row — greyed out
             rows += f"""
             <div class="row faded-row">
               {avatar_html}
@@ -263,8 +309,6 @@ def build_html(results: list, keyword: str, plan: str) -> str:
 
     plan_colors = {"A": "#1976D2", "B": "#7B1FA2", "C": "#2E7D32"}
     badge_color = plan_colors.get(plan, "#333")
-
-    # meta bar: only show not-found count when > 0
     nf_badge = f'&nbsp;&nbsp;<span class="meta-miss">✗ {notfound_count} not posted</span>' if notfound_count > 0 else ""
 
     return f"""<!DOCTYPE html>
@@ -341,7 +385,6 @@ def build_html(results: list, keyword: str, plan: str) -> str:
   {rows}
 </body></html>"""
 
-
 # ── Screenshot using Playwright ─────────────────
 
 async def make_screenshot(results: list, keyword: str, plan: str) -> bytes:
@@ -363,73 +406,31 @@ async def make_screenshot(results: list, keyword: str, plan: str) -> bytes:
         await browser.close()
     return png
 
+# ── Search (reads from local DB instead of live Telegram history) ──
 
-# ── Search ────────────────────────────────────
+def _search_sync(keyword: str, plan_channels: list) -> list:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SEARCH_HOURS)
+    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
 
-async def _search_one(ch_name: str, dialog, keyword: str, index: int) -> tuple:
-    """Search a single channel — runs in parallel with others."""
-    await asyncio.sleep(index * 0.3)  # 0.3s stagger per channel — looks human, avoids rate limit
-    entity    = dialog.entity
-    photo_b64 = await get_photo_b64(entity)
-    username  = getattr(entity, "username", None)
-
-    try:
-        from datetime import datetime, timezone as tz
-        cutoff = datetime.now(tz.utc) - timedelta(hours=SEARCH_HOURS)
-        async for msg in telethon_client.iter_messages(entity, search=keyword, limit=50):
-            if msg.date < cutoff:
-                break
-            if msg.text:
-                link = f"https://t.me/{username}/{msg.id}" if username else f"https://t.me/c/{entity.id}/{msg.id}"
-                return (ch_name, {
-                    "channel":   ch_name,
-                    "time":      to_ist(msg.date),
-                    "text":      msg.text,
-                    "link":      link,
-                    "photo_b64": photo_b64,
-                    "found":     True,
-                })
-    except Exception as e:
-        log.warning(f"Skip [{ch_name}]: {e}")
-
-    return (ch_name, {"channel": ch_name, "found": False, "photo_b64": photo_b64})
-
-
-async def _search(keyword: str, plan_channels: list) -> list:
-    dialogs    = await telethon_client.get_dialogs()
-    plan_names = {ch[0].lower(): ch[0] for ch in plan_channels}
-    matched    = {d.name.lower(): d for d in dialogs if d.name and d.name.lower() in plan_names}
-
-    # Build tasks for all matched channels — run in parallel
-    tasks   = []
-    order   = []
-    for i, (ch_name, ch_link) in enumerate(plan_channels):
-        dialog = matched.get(ch_name.lower())
-        if dialog:
-            tasks.append(_search_one(ch_name, dialog, keyword, i))
-            order.append(ch_name)
-        # unmatched channels handled below
-
-    # Run all searches at the same time
-    task_results = await asyncio.gather(*tasks, return_exceptions=True)
-    result_map   = {}
-    for r in task_results:
-        if isinstance(r, Exception):
-            log.warning(f"Task error: {r}")
-        else:
-            ch_name, data = r
-            result_map[ch_name] = data
-
-    # Rebuild in original plan order
     results = []
     for ch_name, ch_link in plan_channels:
-        if ch_name in result_map:
-            results.append(result_map[ch_name])
+        row = db_search(ch_name, keyword, cutoff)
+        _, photo_b64 = known.get(ch_name.lower(), (None, ""))
+        if row:
+            chat_id, username, message_id, text, date_utc = row
+            dt = datetime.fromisoformat(date_utc)
+            link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+            results.append({
+                "channel":   ch_name,
+                "time":      to_ist(dt),
+                "text":      text,
+                "link":      link,
+                "photo_b64": photo_b64,
+                "found":     True,
+            })
         else:
-            results.append({"channel": ch_name, "found": False, "photo_b64": ""})
-
+            results.append({"channel": ch_name, "found": False, "photo_b64": photo_b64})
     return results
-
 
 # ── /start and /help text ─────────────────────
 
@@ -448,12 +449,14 @@ def start_text() -> str:
         f"_{c_names}_\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📋 /plans — Show all plans and channels\n"
-        "🔧 /debug — Check channel name matching\n"
+        "🔧 /debug — Check which channels bot has seen posts from\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
         "`/b Samsung`\n"
-        "`/c Shoes`"
+        "`/c Shoes`\n\n"
+        "⚠️ *Important:* Bot ko har channel mein ADMIN banao. Sirf add hone ke "
+        "baad ke posts hi search hote hain, purana data nahi milega."
     )
 
 def plans_text() -> str:
@@ -465,7 +468,6 @@ def plans_text() -> str:
             lines.append(f"  {i}. {name}")
         lines.append("")
     return "\n".join(lines)
-
 
 # ── Bot handlers ──────────────────────────────
 
@@ -491,7 +493,7 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan:
 
     try:
         results = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: telethon_run(_search(keyword, plan_channels))
+            None, lambda: _search_sync(keyword, plan_channels)
         )
 
         found_count = sum(1 for r in results if r.get("found"))
@@ -506,10 +508,7 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan:
         await status.edit_text("📸 Generating screenshot...")
         png_bytes = await make_screenshot(results, keyword, plan)
 
-        # Caption: Callout + Links
         not_found_count = len(results) - found_count
-
-    
         links = ""
         for r in results:
             if r.get("found") and r.get("link"):
@@ -520,8 +519,6 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan:
             links += ", ".join(r['channel'] for r in results if not r.get("found"))
 
         caption = links.strip()[:1020]
-        # ── WhatsApp button ──
-        # Use plan-specific group if set, else fall back to user's selected group
         wa_grp = plan_wa_groups.get(plan) or user_wa_group.get(user_id)
         if wa_grp and WA_API_URL:
             cb_id   = f'ws_{uuid.uuid4().hex[:8]}'
@@ -553,9 +550,6 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan:
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         await status.edit_text(f"⚠️ Error: {e}")
-
-
-
 
 # ── /setgroup ─────────────────────────────────────────────
 
@@ -624,7 +618,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     await q.answer()
 
-    # WA group select
     if data.startswith('wg_'):
         idx    = int(data[3:])
         groups = context.user_data.get('wa_groups', [])
@@ -642,9 +635,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f'Pehle /setgroup {plan.lower()} se group set karo!' if plan else 'Pehle /wagroup se group select karo!'
         return await q.answer(msg, show_alert=True)
 
-    # Plan group select (setgroup callback)
     if data.startswith('sg_'):
-        parts = data.split('_')  # sg_A_2
+        parts = data.split('_')
         plan  = parts[1]
         idx   = int(parts[2])
         groups = context.user_data.get('wa_groups', [])
@@ -658,7 +650,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-    # Send to WhatsApp
     if data.startswith('ws_'):
         info = pending_send.get(data)
         if not info:
@@ -688,7 +679,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Delete from WhatsApp
     if data.startswith('wd_'):
         info = sent_wa.get(data)
         if not info:
@@ -702,7 +692,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_caption(caption='❌ Delete nahi hua.', reply_markup=None)
         except Exception as e:
             await q.edit_message_caption(caption=f'❌ Error: {e}', reply_markup=None)
-
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in YOUR_USER_ID:
@@ -737,19 +726,21 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Unauthorised.")
         return
 
-    await update.message.reply_text("🔄 Fetching your joined channels...")
+    known = db_get_known_channels()
+    all_names = [row[1] for row in known if row[1]]
 
-    async def _get_all():
-        dialogs = await telethon_client.get_dialogs()
-        return [d.name for d in dialogs if d.name]
-
-    all_names = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: telethon_run(_get_all())
-    )
+    if not all_names:
+        await update.message.reply_text(
+            "📋 Bot ne abhi tak kisi channel se koi post nahi dekhi.\n\n"
+            "Bot ko har channel mein *admin* banao, fir wahan koi naya message post hote hi "
+            "yahan dikhega.",
+            parse_mode="Markdown"
+        )
+        return
 
     joined_text = "\n".join(f"• `{n}`" for n in sorted(all_names))
     await update.message.reply_text(
-        f"📋 *All joined channels/groups ({len(all_names)}):*\n\n{joined_text}",
+        f"📋 *Channels bot has seen posts from ({len(all_names)}):*\n\n{joined_text}",
         parse_mode="Markdown"
     )
 
@@ -761,39 +752,27 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"*Plan {plan_name} — {len(matched)}/{len(plan_channels)} matched:*\n"
         msg += "\n".join(f"✅ `{n}`" for n in matched)
         if not_matched:
-            msg += "\n\n*Not found (fix spelling):*\n"
+            msg += "\n\n*Not seen yet (add bot as admin here, or fix spelling):*\n"
             msg += "\n".join(f"❌ `{n}`" for n in not_matched)
         await update.message.reply_text(msg, parse_mode="Markdown")
 
-
 # ── Startup ───────────────────────────────────
 
-async def _start_telethon():
-    global telethon_client
-    telethon_client = TelegramClient("/data/user_session", API_ID, API_HASH)
-    await telethon_client.start(phone=PHONE)
-    log.info("✅ Telethon connected!")
-
-
 def main():
+    global bot_instance
     missing = []
-    if API_ID == 0:        missing.append("API_ID")
-    if not API_HASH:       missing.append("API_HASH")
-    if not PHONE:          missing.append("PHONE")
     if not BOT_TOKEN:      missing.append("BOT_TOKEN")
-    if not YOUR_USER_ID:   missing.append("YOUR_USER_ID")
+    if not YOUR_USER_ID:   missing.append("AUTHORIZED_USERS")
     if missing:
         print(f"❌ Please fill in: {', '.join(missing)}")
         return
 
-    t = threading.Thread(target=run_telethon_loop, args=(telethon_loop,), daemon=True)
-    t.start()
+    db_init()
+    log.info("✅ Database ready at %s", DB_PATH)
 
-    log.info("Connecting Telethon...")
-    asyncio.run_coroutine_threadsafe(_start_telethon(), telethon_loop).result(timeout=60)
-
-    log.info("Starting bot...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    bot_instance = app.bot
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CommandHandler("plans", cmd_plans))
@@ -804,8 +783,11 @@ def main():
     app.add_handler(CommandHandler("wagroup",  cmd_wagroup))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # This is the key piece — listens for new posts in any channel the bot is admin of
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
+
     log.info("✅ Bot running! Send /start to your bot.")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
