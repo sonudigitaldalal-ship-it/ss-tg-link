@@ -84,6 +84,37 @@ IST          = timezone(timedelta(hours=5, minutes=30))
 PLANS        = {"A": PLAN_A, "B": PLAN_B, "C": PLAN_C}
 
 # ─────────────────────────────────────────────
+#  BRAND → WhatsApp Group mapping
+#  Jab bhi search keyword mein neeche wala brand-word aaye (case-insensitive,
+#  keyword ke andar kahin bhi), screenshot ke saath ek extra
+#  "📤 Send to <Brand>" button dikhega — us specific WhatsApp group ke liye.
+#  Right side ("Orient Deals Group") bilkul EXACT wahi naam hona chahiye
+#  jo WhatsApp mein group ka naam hai (case-sensitive match hota hai).
+# ─────────────────────────────────────────────
+BRAND_GROUPS = {
+    "orient": "Orient Deals Group",   # <-- yahan Orient ke actual WA group ka naam daalo
+    # "samsung": "Samsung Deals Group",
+    # "boat":    "Boat Deals Group",
+    # jitne chahiye utne brand: group pairs yahan add karte jao
+}
+
+def find_brand_for_keyword(keyword: str):
+    """Keyword ke andar koi known brand-word ho toh uska WA group name return karo."""
+    kw_lower = keyword.lower()
+    for brand, group_name in BRAND_GROUPS.items():
+        if brand in kw_lower:
+            return brand, group_name
+    return None, None
+
+def wa_find_group_by_name(name: str):
+    """WA groups list mein se naam match karke group dict {id, name} return karo."""
+    groups = wa_get_groups()
+    for g in groups:
+        if g["name"].strip().lower() == name.strip().lower():
+            return g
+    return None
+
+# ─────────────────────────────────────────────
 #  DATABASE — stores every channel post the bot sees, once added as admin
 # ─────────────────────────────────────────────
 DB_PATH = os.environ.get("DB_PATH", "/data/messages.db")
@@ -491,6 +522,61 @@ def plans_text() -> str:
 
 # ── Bot handlers ──────────────────────────────
 
+def build_all_group_buttons(img_b64: str, caption: str):
+    """Direct-text search ke baad har WhatsApp group ka button dikhata hai —
+    jo bhi chahiye tap karke seedha wahan bhej do."""
+    if not WA_API_URL:
+        return None
+    groups = wa_get_groups()
+    if not groups:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton('⚠️ Koi WhatsApp group nahi mila (bot connected hai?)', callback_data='no_grp')
+        ]])
+    rows = []
+    for g in groups[:25]:  # Telegram inline keyboard limit ke andar
+        cb_id = f'ws_{uuid.uuid4().hex[:8]}'
+        pending_send[cb_id] = {
+            'img_b64': img_b64, 'caption': caption,
+            'group_id': g['id'], 'group_name': g['name'],
+        }
+        threading.Timer(1800, lambda cid=cb_id: pending_send.pop(cid, None)).start()
+        rows.append([InlineKeyboardButton(f'📤 {g["name"]}', callback_data=cb_id)])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_send_buttons(keyword: str, img_b64: str, caption: str, plan: str = None, plan_wa_grp: dict = None):
+    """Plan-group button + (agar keyword mein brand-word mile) brand-group button banata hai."""
+    rows = []
+
+    if plan_wa_grp and WA_API_URL:
+        cb_id = f'ws_{uuid.uuid4().hex[:8]}'
+        pending_send[cb_id] = {
+            'img_b64': img_b64, 'caption': caption,
+            'group_id': plan_wa_grp['id'], 'group_name': plan_wa_grp['name'],
+        }
+        threading.Timer(1800, lambda: pending_send.pop(cb_id, None)).start()
+        rows.append([InlineKeyboardButton(f'📤 Send to Plan {plan} Group ({plan_wa_grp["name"]})', callback_data=cb_id)])
+    elif plan and WA_API_URL:
+        rows.append([InlineKeyboardButton(f'⚠️ Set Plan {plan} group (/setgroup {plan.lower()})', callback_data=f'no_grp_{plan}')])
+
+    brand, brand_group_name = find_brand_for_keyword(keyword)
+    if brand and WA_API_URL:
+        brand_grp = wa_find_group_by_name(brand_group_name)
+        if brand_grp:
+            cb_id2 = f'ws_{uuid.uuid4().hex[:8]}'
+            pending_send[cb_id2] = {
+                'img_b64': img_b64, 'caption': caption,
+                'group_id': brand_grp['id'], 'group_name': brand_grp['name'],
+            }
+            threading.Timer(1800, lambda: pending_send.pop(cb_id2, None)).start()
+            rows.append([InlineKeyboardButton(f'📤 Send to {brand.capitalize()} ({brand_grp["name"]})', callback_data=cb_id2)])
+        else:
+            rows.append([InlineKeyboardButton(
+                f'⚠️ "{brand_group_name}" WA group nahi mila (naam check karo)', callback_data='no_grp')])
+
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan: str):
     user_id = update.effective_user.id
     if user_id not in YOUR_USER_ID:
@@ -540,25 +626,8 @@ async def plan_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, plan:
 
         caption = links.strip()[:1020]
         wa_grp = plan_wa_groups.get(plan) or user_wa_group.get(user_id)
-        if wa_grp and WA_API_URL:
-            cb_id   = f'ws_{uuid.uuid4().hex[:8]}'
-            img_b64 = base64.b64encode(png_bytes).decode()
-            pending_send[cb_id] = {
-                'img_b64':    img_b64,
-                'caption':    caption.strip()[:900],
-                'group_id':   wa_grp['id'],
-                'group_name': wa_grp['name'],
-            }
-            threading.Timer(1800, lambda: pending_send.pop(cb_id, None)).start()
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f'📤 Send to Plan {plan} Group ({wa_grp["name"]})', callback_data=cb_id)
-            ]])
-        elif WA_API_URL:
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f'⚠️ Set Plan {plan} group (/setgroup {plan.lower()})', callback_data=f'no_grp_{plan}')
-            ]])
-        else:
-            kb = None
+        img_b64 = base64.b64encode(png_bytes).decode()
+        kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan, plan_wa_grp=wa_grp)
 
         await update.message.reply_photo(
             photo=BytesIO(png_bytes),
@@ -773,7 +842,9 @@ async def handle_direct_search(update: Update, context: ContextTypes.DEFAULT_TYP
     status = await update.message.reply_text(f"📸 {len(results)} channel(s) mein mila, screenshot bana raha hoon...")
     png_bytes = await make_screenshot(results, text, "*")
     caption = "\n".join(r["link"] for r in results)[:1020]
-    await update.message.reply_photo(photo=BytesIO(png_bytes), caption=caption[:900])
+    img_b64 = base64.b64encode(png_bytes).decode()
+    kb = build_all_group_buttons(img_b64, caption.strip()[:900])
+    await update.message.reply_photo(photo=BytesIO(png_bytes), caption=caption[:900], reply_markup=kb)
     await status.delete()
 
 
