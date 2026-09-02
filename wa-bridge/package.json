@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "whatsapp-web.js": "^1.26.0",
+    "whatsapp-web.js": "latest",
     "qrcode": "^1.5.4"
   }
 }

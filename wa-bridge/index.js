@@ -80,14 +80,6 @@ async function notifyTelegram(text) {
 // ── WhatsApp Client Setup ──────────────────────────────
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: SESSION_PATH }),
-  // WhatsApp Web ke latest frontend updates se whatsapp-web.js library kabhi-kabhi
-  // break ho jati hai (jaise abhi "getChats" fail ho raha tha). Isko ek stable,
-  // known-working version pe lock karke fix karte hain.
-  webVersionCache: {
-    type: "remote",
-    remotePath:
-      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023950759.html",
-  },
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -179,11 +171,27 @@ app.get("/status", (req, res) => {
   res.json({ ready: isReady, waiting_for_qr: !isReady && !!latestQr });
 });
 
+// getChats() kabhi-kabhi ek known library bug ki wajah se fail ho jata hai
+// ("r: r" error) — 2-3 retries se kai baar pass ho jata hai.
+async function getChatsWithRetry(maxTries = 3) {
+  let lastErr;
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      return await client.getChats();
+    } catch (e) {
+      lastErr = e;
+      console.log(`⚠️ getChats() attempt ${i + 1} fail: ${e.message}, retrying...`);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  throw lastErr;
+}
+
 // Saare groups ki list do
 app.get("/groups", checkApiKey, async (req, res) => {
   if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
   try {
-    const chats = await client.getChats();
+    const chats = await getChatsWithRetry();
     const groups = chats
       .filter((c) => c.isGroup)
       .map((c) => ({ id: c.id._serialized, name: c.name }));
@@ -214,7 +222,7 @@ app.get("/debug-chats", checkApiKey, async (req, res) => {
 app.get("/debug-chats-open", async (req, res) => {
   if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
   try {
-    const chats = await client.getChats();
+    const chats = await getChatsWithRetry();
     const all = chats.map((c) => ({
       name: c.name,
       isGroup: c.isGroup,
