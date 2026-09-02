@@ -149,6 +149,26 @@ def db_search(chat_title: str, keyword: str, cutoff_utc: datetime):
     conn.close()
     return row
 
+def db_search_any_channel(keyword: str, cutoff_utc: datetime):
+    """Like link-tracker's search: find the latest match in EVERY tracked
+    channel (not limited to a plan's fixed channel list). Used when someone
+    pastes a link/keyword directly instead of using /a /b /c."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """
+        SELECT chat_id, chat_title, username, message_id, text, date_utc FROM messages m
+        WHERE text LIKE ? AND date_utc >= ?
+          AND date_utc = (
+              SELECT MAX(date_utc) FROM messages m2
+              WHERE m2.chat_id = m.chat_id AND m2.text LIKE ? AND m2.date_utc >= ?
+          )
+        ORDER BY date_utc DESC
+        """,
+        (f"%{keyword}%", cutoff_utc.isoformat(), f"%{keyword}%", cutoff_utc.isoformat())
+    ).fetchall()
+    conn.close()
+    return rows
+
 # ── WhatsApp API Config ──────────────────────────────────
 WA_API_URL = os.environ.get('WA_API_URL', '').rstrip('/')
 WA_API_KEY = os.environ.get('WA_API_KEY', '')
@@ -711,6 +731,52 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(plans_text(), parse_mode="Markdown")
 
+async def handle_direct_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Purane link-tracker bot wala feature — koi bhi link/keyword seedha
+    bhejo (bina /a /b /c ke), saare tracked channels mein dhoondh ke batayega."""
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return  # silently ignore unauthorised private messages
+
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SEARCH_HOURS)
+    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+
+    rows = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: db_search_any_channel(text, cutoff)
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            f"❌ '{text}' kisi tracked channel mein nahi mila (last {SEARCH_HOURS}h).\n"
+            "Check karo: bot us channel mein admin hai? Post is se pehle hi to nahi aaya?"
+        )
+        return
+
+    results = []
+    for chat_id, chat_title, username, message_id, msg_text, date_utc in rows:
+        dt = datetime.fromisoformat(date_utc)
+        link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+        _, photo_b64 = known.get((chat_title or "").lower(), (None, ""))
+        results.append({
+            "channel":   chat_title or "Unknown",
+            "time":      to_ist(dt),
+            "text":      msg_text,
+            "link":      link,
+            "photo_b64": photo_b64,
+            "found":     True,
+        })
+
+    status = await update.message.reply_text(f"📸 {len(results)} channel(s) mein mila, screenshot bana raha hoon...")
+    png_bytes = await make_screenshot(results, text, "*")
+    caption = "\n".join(r["link"] for r in results)[:1020]
+    await update.message.reply_photo(photo=BytesIO(png_bytes), caption=caption[:900])
+    await status.delete()
+
+
 async def cmd_a(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await plan_handler(update, context, "A")
 
@@ -785,6 +851,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     # This is the key piece — listens for new posts in any channel the bot is admin of
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
+    # Merged from the old link-tracker bot — paste any link/keyword directly in private chat
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_direct_search))
 
     log.info("✅ Bot running! Send /start to your bot.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
