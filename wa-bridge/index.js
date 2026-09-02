@@ -83,11 +83,15 @@ const client = new Client({
   puppeteer: {
     headless: true,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    protocolTimeout: 180000, // 3 min instead of default 30s — Railway resources are tight
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--js-flags=--max-old-space-size=256",
     ],
   },
 });
@@ -112,7 +116,26 @@ client.on("disconnected", (reason) => {
   notifyTelegram(`⚠️ WhatsApp disconnect ho gaya (${reason}). Naya QR generate hoga.`);
 });
 
-client.initialize();
+// initialize() ko try/catch + retry ke saath wrap karo taaki ek fail hone se
+// poora Node process crash na ho (jo pehle poore container ko restart kara raha tha)
+async function startClientWithRetry() {
+  try {
+    await client.initialize();
+  } catch (e) {
+    console.log("⚠️ WhatsApp initialize fail hua, 15 sec baad retry:", e.message);
+    isReady = false;
+    setTimeout(startClientWithRetry, 15000);
+  }
+}
+
+process.on("uncaughtException", (err) => {
+  console.log("⚠️ Uncaught exception (WA bridge process crash nahi hone dega):", err.message);
+});
+process.on("unhandledRejection", (err) => {
+  console.log("⚠️ Unhandled rejection (WA bridge process crash nahi hone dega):", err);
+});
+
+startClientWithRetry();
 
 // ── Auth Middleware ─────────────────────────────────────
 function checkApiKey(req, res, next) {
@@ -157,6 +180,22 @@ app.get("/groups", checkApiKey, async (req, res) => {
       .filter((c) => c.isGroup)
       .map((c) => ({ id: c.id._serialized, name: c.name }));
     res.json({ groups });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Debug: saare chats dikhao (groups + personal dono) taaki pata chale bridge ko kya dikh raha hai
+app.get("/debug-chats", checkApiKey, async (req, res) => {
+  if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
+  try {
+    const chats = await client.getChats();
+    const all = chats.map((c) => ({
+      name: c.name,
+      isGroup: c.isGroup,
+      id: c.id._serialized,
+    }));
+    res.json({ total: all.length, chats: all });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
