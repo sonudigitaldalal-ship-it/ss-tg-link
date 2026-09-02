@@ -1,21 +1,28 @@
 #!/bin/bash
-# Dono processes ek saath start karta hai — agar koi ek crash ho jaye,
-# poora container restart ho jayega (Railway apne aap restart karega).
+# Dono processes independently apni-apni restart-loop mein chalte hain.
+# Agar WA bridge crash ho, sirf wo restart hoga — Telegram bot chalta rahega,
+# aur vice versa. Poora container tabhi restart hoga jab dono ek saath fail ho
+# jayein (Railway health-check timeout, waghera).
 
-set -e
+echo "🚀 Starting WhatsApp bridge (auto-restart loop)..."
+(
+  cd /app/wa-bridge
+  while true; do
+    node index.js
+    echo "⚠️ WhatsApp bridge crash ho gaya, 5 sec baad restart..."
+    sleep 5
+  done
+) &
 
-echo "🚀 Starting WhatsApp bridge..."
-cd /app/wa-bridge && node index.js &
-WA_PID=$!
+echo "🚀 Starting Telegram bot (auto-restart loop)..."
+(
+  cd /app/telegram-bot
+  while true; do
+    python3 telegram_screenshot.py
+    echo "⚠️ Telegram bot crash ho gaya, 5 sec baad restart..."
+    sleep 5
+  done
+) &
 
-echo "🚀 Starting Telegram bot..."
-cd /app/telegram-bot && python3 telegram_screenshot.py &
-TG_PID=$!
-
-# Jo bhi pehle exit ho, uska exit code lo aur dono ko band kar do
-wait -n $WA_PID $TG_PID
-EXIT_CODE=$?
-
-echo "⚠️ Ek process band ho gaya (exit code $EXIT_CODE), dono band kar rahe hain..."
-kill $WA_PID $TG_PID 2>/dev/null || true
-exit $EXIT_CODE
+# Container ko zinda rakho jab tak dono background loops chal rahe hain
+wait
