@@ -33,6 +33,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 try:
     from telethon import TelegramClient, events
+    from telethon.errors import SessionPasswordNeededError
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
@@ -347,6 +348,16 @@ def wa_get_groups():
         log.error(f'wa_get_groups: {e}')
         return []
 
+def wa_get_qr_status():
+    """WA bridge se poochta hai: already logged in hai, ya QR chahiye (aur QR bytes)."""
+    if not WA_API_URL or not WA_API_KEY:
+        return {'ready': False, 'qr_base64': None, 'error': 'WA_API_URL/WA_API_KEY set nahi hain'}
+    try:
+        r = http_requests.get(f'{WA_API_URL}/qr-image', headers=wa_headers(), timeout=10)
+        return r.json()
+    except Exception as e:
+        return {'ready': False, 'qr_base64': None, 'error': str(e)}
+
 def wa_send_image(group_id, img_b64, caption=''):
     r = http_requests.post(f'{WA_API_URL}/send', headers=wa_headers(),
         json={'type': 'image', 'content': img_b64, 'groupId': group_id, 'caption': caption},
@@ -382,6 +393,8 @@ def avatar_color(name: str) -> str:
 # ── Fetch channel profile photo (Bot API) ─────
 
 bot_instance = None  # set in main()
+telethon_client = None       # set in main() — Telethon client (login OTP-driven via bot commands)
+telethon_phone_code_hash = None  # /telethonlogin ke baad OTP verify karne ke liye chahiye
 
 async def refresh_photo_if_needed(chat_id: int, chat_title: str):
     known = {row[0]: row[3] for row in db_get_known_channels()}
@@ -729,6 +742,9 @@ def start_text() -> str:
         "🏷️ /addkeyword <word> — Auto-alert keyword add karo\n"
         "🗑️ /removekeyword <word> — Auto-alert keyword hatao\n"
         "📋 /keywords — Saare auto-alert keywords dekho\n"
+        "🔑 /telethonlogin — Hybrid listener login shuru karo (PC ki zaroorat nahi)\n"
+        "📱 /qr — WhatsApp login status check karo / QR lo\n"
+        "⏱ /olddeal loot 15/8 7:00pm — Purani history search (Telethon chahiye)\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -905,6 +921,35 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+# ── /qr — WhatsApp login status/QR check karta hai ────────
+
+async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not WA_API_URL:
+        return await update.message.reply_text('❌ WA_API_URL env var set nahi hai.')
+
+    status = await update.message.reply_text('🔄 WhatsApp status check kar raha hoon...')
+    result = wa_get_qr_status()
+
+    if result.get('error'):
+        return await status.edit_text(f"⚠️ Error: {result['error']}")
+
+    if result.get('ready'):
+        return await status.edit_text('✅ WhatsApp already login hai — QR ki zaroorat nahi!')
+
+    qr_b64 = result.get('qr_base64')
+    if not qr_b64:
+        return await status.edit_text('⏳ QR abhi generate ho raha hai, thodi der mein /qr dobara try karo.')
+
+    await status.delete()
+    qr_bytes = base64.b64decode(qr_b64)
+    await update.message.reply_photo(
+        photo=BytesIO(qr_bytes),
+        caption="📱 WhatsApp se scan karo:\nSettings → Linked Devices → Link a Device"
+    )
+
 # ── /wagroup ──────────────────────────────────────────────
 
 async def cmd_wagroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1028,6 +1073,121 @@ async def cmd_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(plans_text(), parse_mode="Markdown")
 
+# ── /olddeal — purani history search (Telethon se, live Telegram history) ──
+
+OLD_SEARCH_WINDOW_MINUTES = 30  # target time ke ± kitne minute dekhna hai
+
+def parse_olddeal_args(args_text: str):
+    """'loot 15/8 7:00pm' jaisa text parse karke (keyword, target_datetime_IST) return karta hai."""
+    date_match = re.search(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?', args_text)
+    time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)', args_text, re.IGNORECASE)
+    if not date_match or not time_match:
+        return None, None
+
+    day, month = int(date_match.group(1)), int(date_match.group(2))
+    year = date_match.group(3)
+    year = int(year) if year else datetime.now(IST).year
+    if year < 100:
+        year += 2000
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    ampm = time_match.group(3).lower()
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    try:
+        target = datetime(year, month, day, hour, minute, tzinfo=IST)
+    except ValueError:
+        return None, None
+
+    keyword = args_text[:date_match.start()].strip()
+    return (keyword or None), target
+
+
+async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+
+    if not telethon_client or not (await telethon_client.is_user_authorized()):
+        return await update.message.reply_text(
+            "❌ Ye feature Telethon hybrid login maangta hai (purani history sirf usi se milti hai).\n"
+            "Pehle /telethonlogin karo."
+        )
+
+    args_text = " ".join(context.args) if context.args else ""
+    keyword, target = parse_olddeal_args(args_text)
+    if not keyword or not target:
+        return await update.message.reply_text(
+            "⚠️ *Usage:*\n`/olddeal loot 15/8 7:00pm`\n\n"
+            "Format: `<keyword> <DD/MM> <H:MMam/pm>`\n"
+            f"(target time ke ±{OLD_SEARCH_WINDOW_MINUTES} min ke andar jo bhi post ho wo dhoondega)",
+            parse_mode="Markdown"
+        )
+
+    status = await update.message.reply_text(
+        f"🔍 '{keyword}' ko {target.strftime('%d %b %Y, %I:%M %p')} IST ke aas-paas dhoondh raha hoon "
+        f"(Telegram history se, thoda time lagega)..."
+    )
+
+    window_start = (target - timedelta(minutes=OLD_SEARCH_WINDOW_MINUTES)).astimezone(timezone.utc)
+    window_end   = (target + timedelta(minutes=OLD_SEARCH_WINDOW_MINUTES)).astimezone(timezone.utc)
+
+    # Saare unique channels (Plan A+B+C mila ke, duplicate hata ke)
+    seen_names = set()
+    all_channels = []
+    for plan_channels in PLANS.values():
+        for ch_name, ch_link in plan_channels:
+            if ch_name.lower() not in seen_names:
+                seen_names.add(ch_name.lower())
+                all_channels.append(ch_name)
+
+    try:
+        dialogs = await telethon_client.get_dialogs()
+        dialog_map = {d.name.lower(): d.entity for d in dialogs if d.name}
+    except Exception as e:
+        return await status.edit_text(f"⚠️ Telegram dialogs fetch karne mein error: {e}")
+
+    results = []
+    for ch_name in all_channels:
+        entity = dialog_map.get(ch_name.lower())
+        if not entity:
+            continue  # ye account is channel mein member nahi hai
+        try:
+            async for msg in telethon_client.iter_messages(entity, offset_date=window_end, reverse=False, limit=200):
+                if msg.date < window_start:
+                    break  # itna purana pahunch gaye, ab is channel mein aage dhoondhna bekar hai
+                if msg.date > window_end:
+                    continue
+                if not msg.text or keyword.lower() not in msg.text.lower():
+                    continue
+                username = getattr(entity, "username", None)
+                post_link = f"https://t.me/{username}/{msg.id}" if username else f"https://t.me/c/{abs(entity.id)}/{msg.id}"
+                results.append({
+                    "channel": ch_name, "time": to_ist(msg.date), "text": msg.text,
+                    "link": post_link, "photo_b64": "", "found": True,
+                })
+                break  # is channel ka pehla (sabse relevant) match kaafi hai
+        except Exception as e:
+            log.warning(f"olddeal search failed for {ch_name}: {e}")
+
+    if not results:
+        return await status.edit_text(
+            f"❌ '{keyword}' {target.strftime('%d %b, %I:%M %p')} ke aas-paas kahin nahi mila."
+        )
+
+    png_bytes = await make_screenshot(results, keyword, "⏱")
+    caption = (f"⏱ *'{keyword}' — {target.strftime('%d %b %Y, %I:%M %p')} IST ke aas-paas "
+               f"({len(results)} channel mein mila):*\n\n" +
+               "\n".join(r["link"] for r in results))[:1020]
+    img_b64 = base64.b64encode(png_bytes).decode()
+    kb = build_all_group_buttons(img_b64, caption.strip()[:900])
+    await update.message.reply_photo(photo=BytesIO(png_bytes), caption=caption[:1020], parse_mode="Markdown", reply_markup=kb)
+    await status.delete()
+
+
 async def handle_direct_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Purane link-tracker bot wala feature — koi bhi link/keyword seedha
     bhejo (bina /a /b /c ke), saare tracked channels mein dhoondh ke batayega."""
@@ -1137,6 +1297,70 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chunk.strip():
         await update.message.reply_text(chunk.rstrip(", "), parse_mode="Markdown")
 
+# ── Telethon login via bot commands (no PC/terminal needed) ──────────────
+
+async def cmd_telethonlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global telethon_phone_code_hash
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client:
+        return await update.message.reply_text(
+            "❌ TELETHON_API_ID / TELETHON_API_HASH / TELETHON_PHONE Railway Variables mein set nahi hain."
+        )
+    if telethon_client.is_connected() and await telethon_client.is_user_authorized():
+        return await update.message.reply_text("✅ Telethon already logged in hai!")
+    try:
+        if not telethon_client.is_connected():
+            await telethon_client.connect()
+        result = await telethon_client.send_code_request(TELETHON_PHONE)
+        telethon_phone_code_hash = result.phone_code_hash
+        await update.message.reply_text(
+            "📱 Ek OTP tumhare Telegram app pe aaya hoga — *Telegram* ke apne official "
+            "'service message' se (is bot se nahi, apne saved messages/notifications check karo).\n\n"
+            "Wahi code yahan bhejo:\n`/telethoncode 12345`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def cmd_telethoncode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client:
+        return await update.message.reply_text("❌ Telethon configured nahi hai.")
+    if not context.args:
+        return await update.message.reply_text("Usage: `/telethoncode 12345`", parse_mode="Markdown")
+    code = context.args[0].strip()
+    try:
+        await telethon_client.sign_in(phone=TELETHON_PHONE, code=code, phone_code_hash=telethon_phone_code_hash)
+        register_telethon_handlers(telethon_client)
+        asyncio.create_task(telethon_client.run_until_disconnected())
+        await update.message.reply_text("✅ Telethon login successful! Hybrid listener ab chal raha hai — kisi PC ki zaroorat nahi padi 🎉")
+    except SessionPasswordNeededError:
+        await update.message.reply_text(
+            "🔒 Tumhare account mein 2-Step Verification ON hai. Apna password bhejo:\n"
+            "`/telethonpassword tumhara_password`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}\n\nDobara try karo: /telethonlogin")
+
+async def cmd_telethonpassword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client:
+        return await update.message.reply_text("❌ Telethon configured nahi hai.")
+    if not context.args:
+        return await update.message.reply_text("Usage: `/telethonpassword tumhara_password`", parse_mode="Markdown")
+    pw = " ".join(context.args)
+    try:
+        await telethon_client.sign_in(password=pw)
+        register_telethon_handlers(telethon_client)
+        asyncio.create_task(telethon_client.run_until_disconnected())
+        await update.message.reply_text("✅ Telethon login successful (2FA)! Hybrid listener ab chal raha hai 🎉")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in YOUR_USER_ID:
@@ -1176,7 +1400,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Startup ───────────────────────────────────
 
 async def main():
-    global bot_instance
+    global bot_instance, telethon_client
     missing = []
     if not BOT_TOKEN:      missing.append("BOT_TOKEN")
     if not YOUR_USER_ID:   missing.append("AUTHORIZED_USERS")
@@ -1201,19 +1425,22 @@ async def main():
     app.add_handler(CommandHandler("removekeyword", cmd_removekeyword))
     app.add_handler(CommandHandler("keywords",      cmd_keywords))
     app.add_handler(CommandHandler("wagroup",  cmd_wagroup))
+    app.add_handler(CommandHandler("qr",       cmd_qr))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(CommandHandler("telethonlogin",    cmd_telethonlogin))
+    app.add_handler(CommandHandler("telethoncode",     cmd_telethoncode))
+    app.add_handler(CommandHandler("telethonpassword", cmd_telethonpassword))
+    app.add_handler(CommandHandler("olddeal", cmd_olddeal))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # This is the key piece — listens for new posts in any channel the bot is admin of
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
     # Merged from the old link-tracker bot — paste any link/keyword directly in private chat
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_direct_search))
 
-    # ── Optional hybrid Telethon listener ──
-    telethon_client = None
+    # ── Optional hybrid Telethon listener — login OTP-driven via bot commands ──
     if TELETHON_AVAILABLE and TELETHON_API_ID and TELETHON_API_HASH and TELETHON_PHONE:
         try:
             telethon_client = TelegramClient(TELETHON_SESSION_PATH, int(TELETHON_API_ID), TELETHON_API_HASH)
-            register_telethon_handlers(telethon_client)
         except Exception as e:
             log.error(f"Telethon setup failed, chal raha hai bina hybrid listener ke: {e}")
             telethon_client = None
@@ -1227,14 +1454,17 @@ async def main():
         log.info("✅ Bot running! Send /start to your bot.")
 
         if telethon_client:
-            await telethon_client.start(phone=TELETHON_PHONE)
-            log.info("✅ Telethon hybrid listener running.")
+            await telethon_client.connect()
+            if await telethon_client.is_user_authorized():
+                # Pehle se hi login ho chuka hai (session save hai) — seedha shuru ho jao
+                register_telethon_handlers(telethon_client)
+                asyncio.create_task(telethon_client.run_until_disconnected())
+                log.info("✅ Telethon hybrid listener running (existing session).")
+            else:
+                log.info("ℹ️ Telethon connected but not logged in. Send /telethonlogin to your bot to authorize.")
 
         try:
-            if telethon_client:
-                await telethon_client.run_until_disconnected()
-            else:
-                await asyncio.Event().wait()  # bas zinda rakho jab tak koi stop na kare
+            await asyncio.Event().wait()  # bas zinda rakho jab tak koi stop na kare
         finally:
             await app.updater.stop()
             await app.stop()
