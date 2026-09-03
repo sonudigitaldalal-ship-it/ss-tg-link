@@ -31,6 +31,12 @@ from datetime import timezone, timedelta, datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
+try:
+    from telethon import TelegramClient, events
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 import os
@@ -56,6 +62,19 @@ ensure_chromium()
 # ─────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 YOUR_USER_ID  = [int(x.strip()) for x in os.environ.get("AUTHORIZED_USERS", "").split(",") if x.strip()]
+
+# ─────────────────────────────────────────────
+#  OPTIONAL — Hybrid Telethon listener
+#  Bot API sirf un channels ka data dekh sakta hai jinme bot ADMIN hai.
+#  Agar kisi channel ka owner bot ko admin nahi banata, ye personal-account
+#  listener us channel ko bhi cover kar leta hai (sirf MEMBER hona kaafi hai).
+#  Agar TELETHON_API_ID/HASH/PHONE set nahi hain, ye feature simply skip
+#  ho jata hai — Bot API wala hissa bina kisi dikkat ke chalta rehta hai.
+# ─────────────────────────────────────────────
+TELETHON_API_ID       = os.environ.get("TELETHON_API_ID", "")
+TELETHON_API_HASH     = os.environ.get("TELETHON_API_HASH", "")
+TELETHON_PHONE        = os.environ.get("TELETHON_PHONE", "")
+TELETHON_SESSION_PATH = os.environ.get("TELETHON_SESSION_PATH", "/data/user_session")
 
 # ─────────────────────────────────────────────
 #  STEP 2 — Define your channels
@@ -377,6 +396,48 @@ async def refresh_photo_if_needed(chat_id: int, chat_title: str):
             db_update_photo(chat_id, b64)
     except Exception as e:
         log.warning(f"Photo fetch failed for {chat_title}: {e}")
+
+# ── Telethon hybrid listener (for channels where bot can't be admin) ─────
+
+async def telethon_refresh_photo(client, chat_id: int, chat_title: str):
+    known = {row[0]: row[3] for row in db_get_known_channels()}
+    if known.get(chat_id):
+        return
+    try:
+        data = await client.download_profile_photo(chat_id, file=bytes)
+        if data:
+            b64 = "data:image/jpeg;base64," + base64.b64encode(data).decode()
+            db_update_photo(chat_id, b64)
+    except Exception as e:
+        log.warning(f"Telethon photo fetch failed for {chat_title}: {e}")
+
+
+def register_telethon_handlers(client):
+    """Telethon client pe naye messages ka listener lagata hai — jitne bhi
+    channels mein ye personal account member hai, sab cover ho jate hain."""
+
+    @client.on(events.NewMessage)
+    async def _on_telethon_message(event):
+        try:
+            if not event.message or not event.message.text:
+                return
+            chat = await event.get_chat()
+            title = getattr(chat, "title", None)
+            if not title:
+                return  # DMs, bots, waghera skip — sirf channels/groups chahiye
+            username = getattr(chat, "username", None)
+
+            db_save_message(chat.id, title, username or "", event.message.id, event.message.text, event.message.date)
+            asyncio.create_task(telethon_refresh_photo(client, chat.id, title))
+
+            text_lower = event.message.text.lower()
+            matched = [kw for kw in AUTO_ALERT_KEYWORDS if kw.lower() in text_lower]
+            for kw in matched:
+                asyncio.create_task(check_plan_full_coverage(kw))
+        except Exception as e:
+            log.error(f"Telethon message handler error: {e}", exc_info=True)
+
+    log.info("✅ Telethon hybrid listener registered.")
 
 # ── Channel post listener — this is what replaces Telethon ────
 
@@ -1114,7 +1175,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Startup ───────────────────────────────────
 
-def main():
+async def main():
     global bot_instance
     missing = []
     if not BOT_TOKEN:      missing.append("BOT_TOKEN")
@@ -1147,9 +1208,37 @@ def main():
     # Merged from the old link-tracker bot — paste any link/keyword directly in private chat
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_direct_search))
 
-    log.info("✅ Bot running! Send /start to your bot.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ── Optional hybrid Telethon listener ──
+    telethon_client = None
+    if TELETHON_AVAILABLE and TELETHON_API_ID and TELETHON_API_HASH and TELETHON_PHONE:
+        try:
+            telethon_client = TelegramClient(TELETHON_SESSION_PATH, int(TELETHON_API_ID), TELETHON_API_HASH)
+            register_telethon_handlers(telethon_client)
+        except Exception as e:
+            log.error(f"Telethon setup failed, chal raha hai bina hybrid listener ke: {e}")
+            telethon_client = None
+    else:
+        log.info("ℹ️ Telethon hybrid listener disabled (TELETHON_API_ID/HASH/PHONE set nahi hain).")
+
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        log.info("✅ Bot running! Send /start to your bot.")
+
+        if telethon_client:
+            await telethon_client.start(phone=TELETHON_PHONE)
+            log.info("✅ Telethon hybrid listener running.")
+
+        try:
+            if telethon_client:
+                await telethon_client.run_until_disconnected()
+            else:
+                await asyncio.Event().wait()  # bas zinda rakho jab tak koi stop na kare
+        finally:
+            await app.updater.stop()
+            await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

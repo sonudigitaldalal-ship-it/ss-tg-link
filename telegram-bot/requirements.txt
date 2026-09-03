@@ -1,4 +1,5 @@
 python-telegram-bot
+telethon
 playwright
 Pillow
 requests
