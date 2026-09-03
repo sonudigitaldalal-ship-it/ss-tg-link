@@ -745,6 +745,7 @@ def start_text() -> str:
         "🔑 /telethonlogin — Hybrid listener login shuru karo (PC ki zaroorat nahi)\n"
         "📱 /qr — WhatsApp login status check karo / QR lo\n"
         "⏱ /olddeal loot 15/8 7:00pm — Purani history search (Telethon chahiye)\n"
+        "🔄 /backfill [din] — Pichla data DB mein fetch karo (default 3 din)\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -1299,6 +1300,64 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Telethon login via bot commands (no PC/terminal needed) ──────────────
 
+async def run_backfill(chat_id_for_updates: int, days: int = 3):
+    """Pichle N din ka history fetch karke DB mein daal deta hai — sirf
+    channels/groups (private chats skip), taaki /a /b /c isse bhi kaam kare."""
+    if not telethon_client or not (await telethon_client.is_user_authorized()):
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        dialogs = await telethon_client.get_dialogs()
+    except Exception as e:
+        log.error(f"Backfill: get_dialogs fail: {e}")
+        return
+
+    channels_done = 0
+    messages_saved = 0
+    for d in dialogs:
+        if not d.name or not (d.is_channel or d.is_group):
+            continue
+        entity = d.entity
+        try:
+            async for msg in telethon_client.iter_messages(entity, offset_date=None, reverse=False, limit=500):
+                if msg.date < cutoff:
+                    break
+                if not msg.text:
+                    continue
+                username = getattr(entity, "username", None)
+                db_save_message(entity.id, d.name, username or "", msg.id, msg.text, msg.date)
+                messages_saved += 1
+        except Exception as e:
+            log.warning(f"Backfill failed for {d.name}: {e}")
+            continue
+        channels_done += 1
+
+    try:
+        await bot_instance.send_message(
+            chat_id=chat_id_for_updates,
+            text=f"✅ Backfill complete! {channels_done} channels/groups se {messages_saved} messages "
+                 f"(pichle {days} din) database mein aa gaye. Ab /a /b /c inhe bhi search kar payega."
+        )
+    except Exception:
+        pass
+
+
+async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client or not (await telethon_client.is_user_authorized()):
+        return await update.message.reply_text("❌ Pehle /telethonlogin karo.")
+    days = 3
+    if context.args and context.args[0].isdigit():
+        days = int(context.args[0])
+    await update.message.reply_text(
+        f"🔄 Pichle {days} din ka history fetch ho raha hai (background mein) — "
+        f"jitne zyada channels/groups honge utna time lagega. Poora hone par message aayega."
+    )
+    asyncio.create_task(run_backfill(update.effective_chat.id, days))
+
+
 async def cmd_telethonlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global telethon_phone_code_hash
     if update.effective_user.id not in YOUR_USER_ID:
@@ -1335,7 +1394,11 @@ async def cmd_telethoncode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await telethon_client.sign_in(phone=TELETHON_PHONE, code=code, phone_code_hash=telethon_phone_code_hash)
         register_telethon_handlers(telethon_client)
         asyncio.create_task(telethon_client.run_until_disconnected())
-        await update.message.reply_text("✅ Telethon login successful! Hybrid listener ab chal raha hai — kisi PC ki zaroorat nahi padi 🎉")
+        await update.message.reply_text(
+            "✅ Telethon login successful! Hybrid listener ab chal raha hai — kisi PC ki zaroorat nahi padi 🎉\n\n"
+            "🔄 Pichle 3 din ka data bhi background mein fetch ho raha hai, thodi der mein message aayega."
+        )
+        asyncio.create_task(run_backfill(update.effective_chat.id, days=3))
     except SessionPasswordNeededError:
         await update.message.reply_text(
             "🔒 Tumhare account mein 2-Step Verification ON hai. Apna password bhejo:\n"
@@ -1357,7 +1420,11 @@ async def cmd_telethonpassword(update: Update, context: ContextTypes.DEFAULT_TYP
         await telethon_client.sign_in(password=pw)
         register_telethon_handlers(telethon_client)
         asyncio.create_task(telethon_client.run_until_disconnected())
-        await update.message.reply_text("✅ Telethon login successful (2FA)! Hybrid listener ab chal raha hai 🎉")
+        await update.message.reply_text(
+            "✅ Telethon login successful (2FA)! Hybrid listener ab chal raha hai 🎉\n\n"
+            "🔄 Pichle 3 din ka data bhi background mein fetch ho raha hai, thodi der mein message aayega."
+        )
+        asyncio.create_task(run_backfill(update.effective_chat.id, days=3))
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
@@ -1431,6 +1498,7 @@ async def main():
     app.add_handler(CommandHandler("telethoncode",     cmd_telethoncode))
     app.add_handler(CommandHandler("telethonpassword", cmd_telethonpassword))
     app.add_handler(CommandHandler("olddeal", cmd_olddeal))
+    app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # This is the key piece — listens for new posts in any channel the bot is admin of
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
@@ -1451,17 +1519,22 @@ async def main():
         await app.initialize()
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        log.info("✅ Bot running! Send /start to your bot.")
+        log.info("✅ Bot running! Send /start to your bot. Channel-post listener active.")
 
         if telethon_client:
-            await telethon_client.connect()
-            if await telethon_client.is_user_authorized():
-                # Pehle se hi login ho chuka hai (session save hai) — seedha shuru ho jao
-                register_telethon_handlers(telethon_client)
-                asyncio.create_task(telethon_client.run_until_disconnected())
-                log.info("✅ Telethon hybrid listener running (existing session).")
-            else:
-                log.info("ℹ️ Telethon connected but not logged in. Send /telethonlogin to your bot to authorize.")
+            try:
+                await telethon_client.connect()
+                if await telethon_client.is_user_authorized():
+                    # Pehle se hi login ho chuka hai (session save hai) — seedha shuru ho jao
+                    register_telethon_handlers(telethon_client)
+                    asyncio.create_task(telethon_client.run_until_disconnected())
+                    log.info("✅ Telethon hybrid listener running (existing session).")
+                else:
+                    log.info("ℹ️ Telethon connected but not logged in. Send /telethonlogin to your bot to authorize.")
+            except Exception as e:
+                # Zaroori: Telethon mein koi bhi dikkat aaye, poora bot (Bot API listener bhi)
+                # crash nahi hona chahiye. Isliye yahan catch karke sirf Telethon skip karte hain.
+                log.error(f"⚠️ Telethon connect/start fail hua, Bot API listener normal chalta rahega: {e}", exc_info=True)
 
         try:
             await asyncio.Event().wait()  # bas zinda rakho jab tak koi stop na kare
