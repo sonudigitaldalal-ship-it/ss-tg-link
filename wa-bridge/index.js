@@ -40,6 +40,7 @@ const AUTHORIZED_USERS = (process.env.AUTHORIZED_USERS || "")
 let latestQr = null;
 let isReady = false;
 let sock = null;
+let lastQrSentAt = 0;  // debounce — Baileys QR har ~20 sec mein rotate hota hai, Telegram pe spam na ho
 
 // In-memory map of sent message keys, so /delete can find them later
 const sentMessages = new Map(); // ourKey -> baileys message key
@@ -47,6 +48,13 @@ const sentMessages = new Map(); // ourKey -> baileys message key
 // ── Telegram helpers ─────────────────────────────────
 
 async function sendQrToTelegram(qr) {
+  const now = Date.now();
+  if (now - lastQrSentAt < 45000) {
+    // Baileys ~20 sec mein QR rotate karta hai jab tak scan na ho — isi session
+    // ke liye baar-baar naya photo nahi bhejna, sirf pehli baar.
+    return;
+  }
+  lastQrSentAt = now;
   if (!BOT_TOKEN || AUTHORIZED_USERS.length === 0) {
     console.log("⚠️ BOT_TOKEN ya AUTHORIZED_USERS set nahi hai, QR sirf /qr page par milega.");
     return;
@@ -116,6 +124,7 @@ async function startSocket() {
     if (connection === "open") {
       isReady = true;
       latestQr = null;
+      lastQrSentAt = 0;
       console.log("✅ WhatsApp connected aur ready hai!");
       notifyTelegram("✅ WhatsApp connect ho gaya! Ab /wagroup try kar sakte ho.");
     }
@@ -126,6 +135,7 @@ async function startSocket() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       console.log(`⚠️ WhatsApp disconnect ho gaya (loggedOut=${loggedOut}, code=${statusCode})`);
       if (loggedOut) {
+        lastQrSentAt = 0;
         notifyTelegram("⚠️ WhatsApp session logout ho gaya. Naya QR generate hoga jab dobara start hoga.");
       } else {
         console.log("🔄 Reconnecting...");
@@ -175,6 +185,14 @@ app.get("/qr", async (req, res) => {
 
 app.get("/status", (req, res) => {
   res.json({ ready: isReady, waiting_for_qr: !isReady && !!latestQr });
+});
+
+// Telegram bot ka /qr command isko call karta hai — protected (API key chahiye)
+app.get("/qr-image", checkApiKey, async (req, res) => {
+  if (isReady) return res.json({ ready: true });
+  if (!latestQr) return res.json({ ready: false, qr_base64: null });
+  const qrBuffer = await qrcode.toBuffer(latestQr, { width: 400 });
+  res.json({ ready: false, qr_base64: qrBuffer.toString("base64") });
 });
 
 app.get("/groups", checkApiKey, async (req, res) => {
