@@ -272,6 +272,58 @@ def db_get_known_channels():
     conn.close()
     return rows
 
+DATA_RETENTION_DAYS = 15  # isse purane messages auto-delete ho jate hain (DB chhoti aur fast rehti hai)
+
+def db_cleanup_old_data(days: int = DATA_RETENTION_DAYS) -> int:
+    """DATA_RETENTION_DAYS se purane messages delete karta hai. Deleted rows count return karta hai."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("DELETE FROM messages WHERE date_utc < ?", (cutoff.isoformat(),))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+async def cleanup_loop():
+    """Roz ek baar chalta hai — 15+ din purana data DB se hata deta hai."""
+    while True:
+        await asyncio.sleep(24 * 3600)  # pehli baar 24hr baad (startup ke turant baad zaroorat nahi)
+        try:
+            deleted = await asyncio.get_event_loop().run_in_executor(None, db_cleanup_old_data)
+            log.info(f"🧹 Auto-cleanup: {deleted} purane messages ({DATA_RETENTION_DAYS}+ din) delete kiye.")
+        except Exception as e:
+            log.error(f"Cleanup loop error: {e}")
+
+
+async def telethon_health_check_loop():
+    """Har 5 min mein Telethon session check karta hai — agar logout/disconnect ho jaye
+    (jab pehle authorized tha), Telegram pe alert bhej deta hai."""
+    was_authorized = None
+    while True:
+        await asyncio.sleep(300)
+        if not telethon_client:
+            continue
+        try:
+            authorized = telethon_client.is_connected() and await telethon_client.is_user_authorized()
+        except Exception:
+            authorized = False
+
+        if was_authorized is True and authorized is False:
+            for uid in YOUR_USER_ID:
+                try:
+                    await bot_instance.send_message(
+                        chat_id=uid,
+                        text="⚠️ *Telethon (Telegram hybrid listener) disconnect/logout ho gaya hai!*\n"
+                             "Purane channels ka data ana ruk gaya hoga. Dobara connect karne ke liye:\n"
+                             "/telethonlogin",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+        was_authorized = authorized
+
+
 def db_search(chat_title: str, keyword: str, cutoff_utc: datetime):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
@@ -746,6 +798,7 @@ def start_text() -> str:
         "📱 /qr — WhatsApp login status check karo / QR lo\n"
         "⏱ /olddeal loot 15/8 7:00pm — Purani history search (Telethon chahiye)\n"
         "🔄 /backfill [din] — Pichla data DB mein fetch karo (default 3 din)\n"
+        "📊 /telethonchannels — Kitne channels/groups mein Telethon member hai\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -1358,6 +1411,39 @@ async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(run_backfill(update.effective_chat.id, days))
 
 
+async def cmd_telethonchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telethon account jitne channels/groups mein member hai, unka count + list dikhata hai."""
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client or not (await telethon_client.is_user_authorized()):
+        return await update.message.reply_text("❌ Pehle /telethonlogin karo.")
+
+    status = await update.message.reply_text("🔄 List fetch kar raha hoon...")
+    try:
+        dialogs = await telethon_client.get_dialogs()
+    except Exception as e:
+        return await status.edit_text(f"⚠️ Error: {e}")
+
+    channels = [d for d in dialogs if d.name and d.is_channel and not d.is_group]
+    groups   = [d for d in dialogs if d.name and d.is_group]
+    total = len(channels) + len(groups)
+
+    header = f"📊 *Telethon Account — Total {total} joined ({len(channels)} channels, {len(groups)} groups):*\n\n"
+    names = sorted([d.name for d in channels] + [d.name for d in groups], key=str.lower)
+
+    chunk = header
+    for name in names:
+        piece = f"• {name}\n"
+        if len(chunk) + len(piece) > 3800:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+            chunk = ""
+        chunk += piece
+    if chunk.strip():
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+    await status.delete()
+
+
 async def cmd_telethonlogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global telethon_phone_code_hash
     if update.effective_user.id not in YOUR_USER_ID:
@@ -1499,6 +1585,7 @@ async def main():
     app.add_handler(CommandHandler("telethonpassword", cmd_telethonpassword))
     app.add_handler(CommandHandler("olddeal", cmd_olddeal))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
+    app.add_handler(CommandHandler("telethonchannels", cmd_telethonchannels))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # This is the key piece — listens for new posts in any channel the bot is admin of
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
@@ -1520,6 +1607,8 @@ async def main():
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         log.info("✅ Bot running! Send /start to your bot. Channel-post listener active.")
+        asyncio.create_task(cleanup_loop())
+        asyncio.create_task(telethon_health_check_loop())
 
         if telethon_client:
             try:
