@@ -80,6 +80,89 @@ PLAN_B = [CH1, CH2, CH5, CH10, CH7, CH3, CH4]
 PLAN_C = [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8, CH9]
 
 SEARCH_HOURS = 12   # only search posts from last X hours
+
+# ── Hot-Deal Auto-Alert config ─────────────────────────
+# Jab bhi neeche wali list ka koi brand/keyword kisi Plan (A/B/C) ke SAARE
+# channels mein post ho jaye (AUTO_ALERT_WINDOW_MINUTES ke andar), bot khud
+# us plan ka poora screenshot generate karke bhej dega. Link match nahi karta
+# (har channel apna alag affiliate link daalta hai) — sirf keyword/brand text
+# match karta hai, isliye zyada reliable hai.
+AUTO_ALERT_WINDOW_MINUTES = 15
+
+# Ye sirf DEFAULT/starting list hai — pehli baar bot chalne par ye file mein
+# save ho jayegi. Uske baad /addkeyword, /removekeyword, /keywords commands
+# se seedha Telegram se hi manage kar sakte ho, code edit karne ki zaroorat nahi.
+DEFAULT_AUTO_ALERT_KEYWORDS = [
+    "aqueria", "urbn", "Bella Vita", "boat", "oscar", "lifelong", "amazon pay",
+    "wicked gud", "dubstep", "sirona", "bla bli blu", "plantex", "desidiya", "bigmuscle",
+    "fytika", "kapiva", "skullcandy", "orient", "rage", "medibuddy", "exercise",
+    "fitness", "abexcerciser", "portonics", "realme", "jockey", "baby care",
+    "baby diaper", "flipkart", "epson", "havells", "babur", "halonix", "mcaffeine",
+    "dubset", "nutribrust", "tower", "ai+", "mamypoko", "wishcare", "kick scooter",
+    "dexogrow", "Stuffcool", "redme", "gold", "bournvita", "dermaco", "baidyanath",
+    "my fitness", "pilgrim", "provouge", "kids toys", "beyond", "cheffin", "Toreto",
+    "Oziva", "Vervenix", "jabra", "Yogabar", "Nutrabuds", "raxon", "sale post", "apple",
+    "powerbank", "cables", "mi powerbank", "vw", "Liposomal", "personal care",
+    "detergent", "nutriglow", "eucos", "vega", "liquid", "milton", "tv", "zebronics",
+    "spigen cover", "kids scooter", "reuable", "pest control", "royal fusion", "samsung",
+    "ayuvana", "lila", "maternity pads", "godrej", "hushbay", "bosch", "hipkoo",
+    "bathla", "remote car", "plix", "dr morepen", "naturaltein", "dr seths",
+    "himalaya shivang", "car", "kozicare", "cadlec kitchen", "heaven décor", "q device",
+    "youva", "sujata", "cred", "shilajit", "hk vitals", "aristocrate", "kuchipoo",
+    "exercise cycle", "treadmill", "beardo", "bajaj", "rasayanam", "complan", "forest",
+    "neemans", "little anglel", "dermatouch", "sugar", "deconstruct", "ruhe", "volo",
+    "qubo", "muscleblase", "nutrabay", "optimum nutrion", "lemorte", "agaro",
+    "home kitchen", "branded screen guard", "kesh king", "mirabelle", "bonkasio",
+    "art & craft", "GNC", "Miton", "Lattitude", "Herb", "Dolls & Dolls", "Mee Mee",
+    "Indoor Ganes", "Fitnnes beach", "Exercise Bike", "Pen", "cycel", "origami",
+    "Molecular Company", "velbiorn", "Mush Bamboo", "Board Games earnpe",
+    "baby activity earnpe", "philips earnpe", "sycle", "bike", "cycle", "shaker", "iqoo",
+    "air fryer", "Syngenta", "lg tv", "crocs", "Wildcraft", "American Tousister",
+    "Nirvasa", "Dr. Morepen", "TP link", "camping tent", "back & Abdomen",
+    "resistance tube", "fitness epqipment", "Caresmith", "oralB", "Oneplus",
+    "Bunny earnpe", "lego earnpe", "kids toy earnpe", "libas", "Optimist",
+    "laptop accessories", "sports", "walkpad", "mamaearth", "bblunt", "goodcare",
+    "cricket", "fastup", "supradyn", "scoot International", "earnpe", "kids mandi",
+    "kraasa", "fubar", "hp tablet", "li ning", "healtyhey", "vlado", "Portronics",
+    "Rakhi", "Sanilo", "campus", "CMF", "go boult", "bhim", "Zomato", "Ensure",
+    "Bissell", "Purna", "Nutriburst", "A R Ayurveda", "motorola", "plant", "nutrela",
+    "magnesium", "joy", "dr truskin", "the derma co", "baben", "ambrane", "kinsco",
+    "sugar fit", "miduty", "one 8", "fuelone", "Foxsky", "Lemonn", "little angel",
+    "baby walker", "little joy", "beast Life", "liberty", "horlics", "Bear", "noise",
+    "parxen", "Navi", "boltt", "vyom", "aquon", "Pw", "nakpro", "cash counting", "beetl",
+    "Undenatured", "Copier Paper", "TMC", "Ghangaria", "Modius", "Awsome", "Clarity Lab",
+    "Lava",
+    # naye keyword (is baar ke request se)
+    "loot", "grab", "fast", "loot fast", "grab fast", "lowest", "set of", "weight",
+    "management",
+]
+
+KEYWORDS_FILE = os.environ.get("KEYWORDS_FILE", "/data/alert_keywords.json")
+
+def load_alert_keywords():
+    import json
+    try:
+        if os.path.exists(KEYWORDS_FILE):
+            with open(KEYWORDS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        log.error(f"load_alert_keywords: {e}")
+    return list(DEFAULT_AUTO_ALERT_KEYWORDS)
+
+def save_alert_keywords(keywords):
+    import json
+    try:
+        os.makedirs(os.path.dirname(KEYWORDS_FILE), exist_ok=True)
+        with open(KEYWORDS_FILE, 'w') as f:
+            json.dump(keywords, f, indent=2)
+    except Exception as e:
+        log.error(f"save_alert_keywords: {e}")
+
+AUTO_ALERT_KEYWORDS = load_alert_keywords()
+if not os.path.exists(KEYWORDS_FILE):
+    save_alert_keywords(AUTO_ALERT_KEYWORDS)  # pehli baar file bana do
+
+alerted_plan_keywords = set()  # (plan, keyword) pairs jinke liye already alert ja chuka hai
 IST          = timezone(timedelta(hours=5, minutes=30))
 PLANS        = {"A": PLAN_A, "B": PLAN_B, "C": PLAN_C}
 
@@ -297,6 +380,82 @@ async def refresh_photo_if_needed(chat_id: int, chat_title: str):
 
 # ── Channel post listener — this is what replaces Telethon ────
 
+async def check_plan_full_coverage(keyword: str):
+    """Agar ye keyword/brand kisi Plan ke SAARE channels mein mil chuka hai
+    (last AUTO_ALERT_WINDOW_MINUTES mein), us plan ka poora screenshot
+    generate karke saare authorized users ko bhej do."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_ALERT_WINDOW_MINUTES)
+    rows = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: db_search_any_channel(keyword, cutoff)
+    )
+    if not rows:
+        return
+
+    matched_titles_lower = {(row[1] or "").lower() for row in rows}
+    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    rows_by_title = {(row[1] or "").lower(): row for row in rows}
+
+    for plan_name, plan_channels in PLANS.items():
+        plan_names_lower = {ch[0].lower() for ch in plan_channels}
+        if not plan_names_lower.issubset(matched_titles_lower):
+            continue  # is plan ke saare channels mein abhi tak nahi aaya
+
+        key = (plan_name, keyword.lower())
+        if key in alerted_plan_keywords:
+            continue  # is plan ke liye is keyword pe pehle hi alert bhej chuke hain
+        alerted_plan_keywords.add(key)
+
+        results = []
+        for ch_name, ch_link in plan_channels:
+            row = rows_by_title.get(ch_name.lower())
+            _, photo_b64 = known.get(ch_name.lower(), (None, ""))
+            if row:
+                chat_id, chat_title, username, message_id, msg_text, date_utc = row
+                dt = datetime.fromisoformat(date_utc)
+                post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+                results.append({
+                    "channel": ch_name, "time": to_ist(dt), "text": msg_text,
+                    "link": post_link, "photo_b64": photo_b64, "found": True,
+                })
+            else:
+                results.append({"channel": ch_name, "found": False, "photo_b64": photo_b64})
+
+        try:
+            png_bytes = await make_screenshot(results, keyword, plan_name)
+            caption = (f"🔥 *Plan {plan_name} mein '{keyword}' poore plan mein mila!* "
+                       f"Sab {len(plan_channels)} channels mein aaya:\n\n" +
+                       "\n".join(r["link"] for r in results if r.get("found")))[:1020]
+            img_b64 = base64.b64encode(png_bytes).decode()
+            wa_grp = plan_wa_groups.get(plan_name)
+
+            if wa_grp and WA_API_URL:
+                # Seedha WhatsApp group mein bhej do — button dabana nahi padega
+                wa_caption = caption.strip()[:900]
+                res = wa_send_image(wa_grp['id'], img_b64, wa_caption)
+                if res.get('success'):
+                    del_id = f'wd_{uuid.uuid4().hex[:8]}'
+                    sent_wa[del_id] = {'key': res['key'], 'group_id': wa_grp['id']}
+                    threading.Timer(600, lambda: sent_wa.pop(del_id, None)).start()
+                    tg_caption = f"✅ *Auto-sent to {wa_grp['name']}!*\n\n{caption[:850]}"
+                    kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=del_id)
+                    ]])
+                else:
+                    tg_caption = f"⚠️ WhatsApp send fail hua ({res.get('error', 'unknown')}):\n\n{caption[:850]}"
+                    kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan_name, plan_wa_grp=wa_grp)
+            else:
+                tg_caption = caption[:900]
+                kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan_name, plan_wa_grp=wa_grp)
+
+            for uid in YOUR_USER_ID:
+                await bot_instance.send_photo(
+                    chat_id=uid, photo=BytesIO(png_bytes),
+                    caption=tg_caption[:1020], parse_mode="Markdown", reply_markup=kb,
+                )
+        except Exception as e:
+            log.error(f"Plan auto-alert failed for Plan {plan_name}: {e}", exc_info=True)
+
+
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     if not msg or not msg.text:
@@ -304,6 +463,11 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = msg.chat
     db_save_message(chat.id, chat.title or "", chat.username or "", msg.message_id, msg.text, msg.date)
     asyncio.create_task(refresh_photo_if_needed(chat.id, chat.title or ""))
+
+    text_lower = msg.text.lower()
+    matched = [kw for kw in AUTO_ALERT_KEYWORDS if kw.lower() in text_lower]
+    for kw in matched:
+        asyncio.create_task(check_plan_full_coverage(kw))
 
 # ── HTML builder ──────────────────────────────
 
@@ -501,6 +665,9 @@ def start_text() -> str:
         "━━━━━━━━━━━━━━━━━━━━\n"
         "📋 /plans — Show all plans and channels\n"
         "🔧 /debug — Check which channels bot has seen posts from\n"
+        "🏷️ /addkeyword <word> — Auto-alert keyword add karo\n"
+        "🗑️ /removekeyword <word> — Auto-alert keyword hatao\n"
+        "📋 /keywords — Saare auto-alert keywords dekho\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -857,6 +1024,58 @@ async def cmd_b(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_c(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await plan_handler(update, context, "C")
 
+# ── /addkeyword, /removekeyword, /keywords — manage AUTO_ALERT_KEYWORDS ────
+
+async def cmd_addkeyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Usage: `/addkeyword loot fast`\n(ek command mein ek hi keyword/phrase)",
+            parse_mode="Markdown"
+        )
+    kw = " ".join(context.args).strip()
+    existing_lower = [k.lower() for k in AUTO_ALERT_KEYWORDS]
+    if kw.lower() in existing_lower:
+        return await update.message.reply_text(f"ℹ️ '{kw}' pehle se list mein hai.")
+    AUTO_ALERT_KEYWORDS.append(kw)
+    save_alert_keywords(AUTO_ALERT_KEYWORDS)
+    await update.message.reply_text(f"✅ '{kw}' add ho gaya. Total keywords: {len(AUTO_ALERT_KEYWORDS)}")
+
+async def cmd_removekeyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ Usage: `/removekeyword loot fast`", parse_mode="Markdown"
+        )
+    kw = " ".join(context.args).strip().lower()
+    match = next((k for k in AUTO_ALERT_KEYWORDS if k.lower() == kw), None)
+    if not match:
+        return await update.message.reply_text(f"❌ '{kw}' list mein nahi mila.")
+    AUTO_ALERT_KEYWORDS.remove(match)
+    save_alert_keywords(AUTO_ALERT_KEYWORDS)
+    await update.message.reply_text(f"🗑️ '{match}' hata diya. Total keywords: {len(AUTO_ALERT_KEYWORDS)}")
+
+async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not AUTO_ALERT_KEYWORDS:
+        return await update.message.reply_text("Koi keyword set nahi hai.")
+    sorted_kw = sorted(AUTO_ALERT_KEYWORDS, key=str.lower)
+    header = f"📋 *Auto-Alert Keywords ({len(sorted_kw)}):*\n\n"
+    body = ", ".join(sorted_kw)
+    # Telegram message limit ~4096 chars — chunks mein bhejo agar lamba ho
+    chunk = header
+    for item in sorted_kw:
+        piece = item + ", "
+        if len(chunk) + len(piece) > 3800:
+            await update.message.reply_text(chunk.rstrip(", "), parse_mode="Markdown")
+            chunk = ""
+        chunk += piece
+    if chunk.strip():
+        await update.message.reply_text(chunk.rstrip(", "), parse_mode="Markdown")
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in YOUR_USER_ID:
@@ -917,6 +1136,9 @@ def main():
     app.add_handler(CommandHandler("b",     cmd_b))
     app.add_handler(CommandHandler("c",     cmd_c))
     app.add_handler(CommandHandler("debug",   cmd_debug))
+    app.add_handler(CommandHandler("addkeyword",    cmd_addkeyword))
+    app.add_handler(CommandHandler("removekeyword", cmd_removekeyword))
+    app.add_handler(CommandHandler("keywords",      cmd_keywords))
     app.add_handler(CommandHandler("wagroup",  cmd_wagroup))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CallbackQueryHandler(handle_callback))
