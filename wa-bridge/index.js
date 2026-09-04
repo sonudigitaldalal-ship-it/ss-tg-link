@@ -41,6 +41,7 @@ let latestQr = null;
 let isReady = false;
 let sock = null;
 let lastQrSentAt = 0;  // debounce — Baileys QR har ~20 sec mein rotate hota hai, Telegram pe spam na ho
+let lastConnectedNotifyAt = 0;  // debounce — chhote reconnects ke liye baar-baar "connected" msg na aaye
 
 // In-memory map of sent message keys, so /delete can find them later
 const sentMessages = new Map(); // ourKey -> baileys message key
@@ -107,6 +108,8 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ["Chrome (Linux)", "Chrome", "120.0.0"],
+    keepAliveIntervalMs: 20000,   // thoda tighter keep-alive — connection drop kam ho
+    connectTimeoutMs: 60000,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -126,7 +129,13 @@ async function startSocket() {
       latestQr = null;
       lastQrSentAt = 0;
       console.log("✅ WhatsApp connected aur ready hai!");
-      notifyTelegram("✅ WhatsApp connect ho gaya! Ab /wagroup try kar sakte ho.");
+      const now = Date.now();
+      if (now - lastConnectedNotifyAt > 60 * 60 * 1000) {
+        // Chhote reconnects (network blip, waghera) normal hain — spam na ho,
+        // isliye is notification ko max 1 baar/ghanta bhejte hain.
+        lastConnectedNotifyAt = now;
+        notifyTelegram("✅ WhatsApp connect ho gaya! Ab /wagroup try kar sakte ho.");
+      }
     }
 
     if (connection === "close") {
