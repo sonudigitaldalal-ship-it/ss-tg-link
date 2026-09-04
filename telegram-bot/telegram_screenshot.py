@@ -220,35 +220,41 @@ def save_alert_mode(mode):
 AUTO_ALERT_MODE = load_alert_mode()
 
 # ─────────────────────────────────────────────
-#  BRAND → WhatsApp Group mapping
-#  Jab bhi search keyword mein neeche wala brand-word aaye (case-insensitive,
-#  keyword ke andar kahin bhi), screenshot ke saath ek extra
-#  "📤 Send to <Brand>" button dikhega — us specific WhatsApp group ke liye.
-#  Right side ("Orient Deals Group") bilkul EXACT wahi naam hona chahiye
-#  jo WhatsApp mein group ka naam hai (case-sensitive match hota hai).
+#  BRAND → WhatsApp Group mapping (Telegram se hi manage hota hai)
+#  /setbrandgroup <brand> — group select karke set karo
+#  /brandgroups — current mappings dekho
+#  /removebrandgroup <brand> — hatao
 # ─────────────────────────────────────────────
-BRAND_GROUPS = {
-    "orient": "Orient Deals Group",   # <-- yahan Orient ke actual WA group ka naam daalo
-    # "samsung": "Samsung Deals Group",
-    # "boat":    "Boat Deals Group",
-    # jitne chahiye utne brand: group pairs yahan add karte jao
-}
+BRAND_GROUPS_FILE = os.environ.get("BRAND_GROUPS_FILE", "/data/brand_groups.json")
+
+def load_brand_groups():
+    import json
+    try:
+        if os.path.exists(BRAND_GROUPS_FILE):
+            with open(BRAND_GROUPS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        log.error(f"load_brand_groups: {e}")
+    return {}
+
+def save_brand_groups(data):
+    import json
+    try:
+        os.makedirs(os.path.dirname(BRAND_GROUPS_FILE), exist_ok=True)
+        with open(BRAND_GROUPS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.error(f"save_brand_groups: {e}")
+
+BRAND_GROUPS = load_brand_groups()  # { "orient": {"id": "12345@g.us", "name": "Orient Deals Group"}, ... }
 
 def find_brand_for_keyword(keyword: str):
-    """Keyword ke andar koi known brand-word ho toh uska WA group name return karo."""
+    """Keyword ke andar koi known brand-word ho toh (brand, group_dict) return karo."""
     kw_lower = keyword.lower()
-    for brand, group_name in BRAND_GROUPS.items():
+    for brand, group in BRAND_GROUPS.items():
         if brand in kw_lower:
-            return brand, group_name
+            return brand, group
     return None, None
-
-def wa_find_group_by_name(name: str):
-    """WA groups list mein se naam match karke group dict {id, name} return karo."""
-    groups = wa_get_groups()
-    for g in groups:
-        if g["name"].strip().lower() == name.strip().lower():
-            return g
-    return None
 
 # ─────────────────────────────────────────────
 #  DATABASE — stores every channel post the bot sees, once added as admin
@@ -608,6 +614,26 @@ async def check_plan_full_coverage(keyword: str):
                     chat_id=uid, photo=BytesIO(png_bytes),
                     caption=tg_caption[:1020], parse_mode="Markdown", reply_markup=kb,
                 )
+
+            # Brand-specific group mein bhi auto-send karo agar keyword kisi brand se match kare
+            brand, brand_grp = find_brand_for_keyword(keyword)
+            if brand and brand_grp and WA_API_URL:
+                brand_res = wa_send_image(brand_grp['id'], img_b64, caption.strip()[:900])
+                if brand_res.get('success'):
+                    brand_del_id = f'wd_{uuid.uuid4().hex[:8]}'
+                    sent_wa[brand_del_id] = {'key': brand_res['key'], 'group_id': brand_grp['id']}
+                    threading.Timer(600, lambda: sent_wa.pop(brand_del_id, None)).start()
+                    brand_kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=brand_del_id)
+                    ]])
+                    for uid in YOUR_USER_ID:
+                        await bot_instance.send_message(
+                            chat_id=uid,
+                            text=f"✅ *Brand match!* '{keyword}' → *{brand_grp['name']}* mein bhi auto-sent!",
+                            parse_mode="Markdown", reply_markup=brand_kb,
+                        )
+                else:
+                    log.warning(f"Brand auto-send failed for {brand}: {brand_res.get('error')}")
         except Exception as e:
             log.error(f"Plan auto-alert failed for Plan {plan_name}: {e}", exc_info=True)
 
@@ -651,6 +677,29 @@ async def check_link_multi_channel(link: str):
                 chat_id=uid, photo=BytesIO(png_bytes),
                 caption=caption[:1020], parse_mode="Markdown", reply_markup=kb,
             )
+
+        # Keyword-mode mein bhi brand-detection + brand-group auto-send —
+        # yahan koi ek "keyword" nahi hota, isliye post ke actual text mein
+        # brand-word dhoondte hain.
+        combined_text = " ".join(r.get("text", "") for r in results)
+        brand, brand_grp = find_brand_for_keyword(combined_text)
+        if brand and brand_grp and WA_API_URL:
+            brand_res = wa_send_image(brand_grp['id'], img_b64, caption.strip()[:900])
+            if brand_res.get('success'):
+                brand_del_id = f'wd_{uuid.uuid4().hex[:8]}'
+                sent_wa[brand_del_id] = {'key': brand_res['key'], 'group_id': brand_grp['id']}
+                threading.Timer(600, lambda: sent_wa.pop(brand_del_id, None)).start()
+                brand_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=brand_del_id)
+                ]])
+                for uid in YOUR_USER_ID:
+                    await bot_instance.send_message(
+                        chat_id=uid,
+                        text=f"✅ *Brand match!* → *{brand_grp['name']}* mein bhi auto-sent!",
+                        parse_mode="Markdown", reply_markup=brand_kb,
+                    )
+            else:
+                log.warning(f"Brand auto-send failed for {brand}: {brand_res.get('error')}")
     except Exception as e:
         log.error(f"Link-mode auto-alert failed: {e}", exc_info=True)
 
@@ -666,7 +715,6 @@ def dispatch_auto_alert(text: str):
         urls = URL_REGEX.findall(text)
         if urls:
             asyncio.create_task(check_link_multi_channel(urls[0]))
-
 
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
@@ -884,6 +932,8 @@ def start_text() -> str:
         "📊 /telethonchannels — Kitne channels/groups mein Telethon member hai\n"
         "🔀 /setmode plan|keyword — Auto-alert mode badlo\n"
         "📍 /mode — Current auto-alert mode dekho\n"
+        "🏷️ /setbrandgroup orient — Brand ko WhatsApp group se map karo\n"
+        "📋 /brandgroups — Saare brand-group mappings dekho\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -942,20 +992,15 @@ def build_send_buttons(keyword: str, img_b64: str, caption: str, plan: str = Non
     elif plan and WA_API_URL:
         rows.append([InlineKeyboardButton(f'⚠️ Set Plan {plan} group (/setgroup {plan.lower()})', callback_data=f'no_grp_{plan}')])
 
-    brand, brand_group_name = find_brand_for_keyword(keyword)
-    if brand and WA_API_URL:
-        brand_grp = wa_find_group_by_name(brand_group_name)
-        if brand_grp:
-            cb_id2 = f'ws_{uuid.uuid4().hex[:8]}'
-            pending_send[cb_id2] = {
-                'img_b64': img_b64, 'caption': caption,
-                'group_id': brand_grp['id'], 'group_name': brand_grp['name'],
-            }
-            threading.Timer(1800, lambda: pending_send.pop(cb_id2, None)).start()
-            rows.append([InlineKeyboardButton(f'📤 Send to {brand.capitalize()} ({brand_grp["name"]})', callback_data=cb_id2)])
-        else:
-            rows.append([InlineKeyboardButton(
-                f'⚠️ "{brand_group_name}" WA group nahi mila (naam check karo)', callback_data='no_grp')])
+    brand, brand_grp = find_brand_for_keyword(keyword)
+    if brand and brand_grp and WA_API_URL:
+        cb_id2 = f'ws_{uuid.uuid4().hex[:8]}'
+        pending_send[cb_id2] = {
+            'img_b64': img_b64, 'caption': caption,
+            'group_id': brand_grp['id'], 'group_name': brand_grp['name'],
+        }
+        threading.Timer(1800, lambda: pending_send.pop(cb_id2, None)).start()
+        rows.append([InlineKeyboardButton(f'📤 Send to {brand.capitalize()} ({brand_grp["name"]})', callback_data=cb_id2)])
 
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -1060,6 +1105,63 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
+# ── /setbrandgroup, /brandgroups, /removebrandgroup — brand→WA group mapping ──
+
+async def cmd_setbrandgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text('⛔ Unauthorised.')
+    if not WA_API_URL:
+        return await update.message.reply_text('❌ WA_API_URL set nahi hai.')
+    if not context.args:
+        return await update.message.reply_text(
+            '⚠️ Usage: `/setbrandgroup orient`\n(brand ka naam do, phir group select karoge)',
+            parse_mode='Markdown'
+        )
+
+    brand = " ".join(context.args).strip().lower()
+    msg = await update.message.reply_text(f'🔄 "{brand}" ke liye groups load ho rahe hain...')
+    groups = wa_get_groups()
+    if not groups:
+        return await msg.edit_text('❌ Groups nahi mile. WA API connected hai?')
+
+    kb = [[InlineKeyboardButton(f'💬 {g["name"]}', callback_data=f'bg_{brand}_{i}')]
+          for i, g in enumerate(groups[:25])]
+    context.user_data['wa_groups'] = groups
+    await msg.edit_text(
+        f'📋 *"{brand}"* keyword ke liye group select karo:',
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+async def cmd_brandgroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text('⛔ Unauthorised.')
+    if not BRAND_GROUPS:
+        return await update.message.reply_text(
+            'Koi brand-group mapping set nahi hai.\nUsage: `/setbrandgroup orient`',
+            parse_mode='Markdown'
+        )
+    lines = [f'• *{b}* → {g["name"]}' for b, g in sorted(BRAND_GROUPS.items())]
+    await update.message.reply_text(
+        f'📋 *Brand → WhatsApp Group mappings ({len(BRAND_GROUPS)}):*\n\n' + '\n'.join(lines),
+        parse_mode='Markdown'
+    )
+
+async def cmd_removebrandgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in YOUR_USER_ID:
+        return await update.message.reply_text('⛔ Unauthorised.')
+    if not context.args:
+        return await update.message.reply_text('Usage: `/removebrandgroup orient`', parse_mode='Markdown')
+    brand = " ".join(context.args).strip().lower()
+    if brand not in BRAND_GROUPS:
+        return await update.message.reply_text(f'❌ "{brand}" ke liye koi mapping set nahi hai.')
+    del BRAND_GROUPS[brand]
+    save_brand_groups(BRAND_GROUPS)
+    await update.message.reply_text(f'🗑️ "{brand}" ka mapping hata diya.')
+
 # ── /qr — WhatsApp login status/QR check karta hai ────────
 
 async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1148,6 +1250,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_plan_groups(plan_wa_groups)
         return await q.edit_message_text(
             f'✅ *Plan {plan}* → *{g["name"]}*\n\nAb /{plan.lower()} se search karo — button automatically is group mein bhejega! 🚀',
+            parse_mode='Markdown'
+        )
+
+    if data.startswith('bg_'):
+        rest = data[3:]
+        brand, idx_str = rest.rsplit('_', 1)
+        idx = int(idx_str)
+        groups = context.user_data.get('wa_groups', [])
+        if idx >= len(groups):
+            return await q.edit_message_text('❌ /setbrandgroup dobara try karo.')
+        g = groups[idx]
+        BRAND_GROUPS[brand] = {'id': g['id'], 'name': g['name']}
+        save_brand_groups(BRAND_GROUPS)
+        return await q.edit_message_text(
+            f'✅ *"{brand}"* → *{g["name"]}*\n\nAb jab bhi "{brand}" match hoga, is group mein bhi auto-send hoga! 🚀',
             parse_mode='Markdown'
         )
 
@@ -1289,6 +1406,8 @@ async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         return await status.edit_text(f"⚠️ Telegram dialogs fetch karne mein error: {e}")
 
+    known_photos = {row[1].lower(): row[3] for row in db_get_known_channels() if row[1]}
+
     results = []
     for ch_name in all_channels:
         entity = dialog_map.get(ch_name.lower())
@@ -1304,9 +1423,22 @@ async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 username = getattr(entity, "username", None)
                 post_link = f"https://t.me/{username}/{msg.id}" if username else f"https://t.me/c/{abs(entity.id)}/{msg.id}"
+
+                # Channel ka photo — pehle cache se, nahi to seedha Telethon se fetch karo
+                photo_b64 = known_photos.get(ch_name.lower(), "")
+                if not photo_b64:
+                    try:
+                        photo_bytes = await telethon_client.download_profile_photo(entity, file=bytes)
+                        if photo_bytes:
+                            photo_b64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
+                            db_update_photo(entity.id, photo_b64)
+                            known_photos[ch_name.lower()] = photo_b64
+                    except Exception as e:
+                        log.warning(f"olddeal photo fetch failed for {ch_name}: {e}")
+
                 results.append({
                     "channel": ch_name, "time": to_ist(msg.date), "text": msg.text,
-                    "link": post_link, "photo_b64": "", "found": True,
+                    "link": post_link, "photo_b64": photo_b64, "found": True,
                 })
                 break  # is channel ka pehla (sabse relevant) match kaafi hai
         except Exception as e:
@@ -1689,6 +1821,9 @@ async def main():
     app.add_handler(CommandHandler("wagroup",  cmd_wagroup))
     app.add_handler(CommandHandler("qr",       cmd_qr))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(CommandHandler("setbrandgroup",    cmd_setbrandgroup))
+    app.add_handler(CommandHandler("brandgroups",      cmd_brandgroups))
+    app.add_handler(CommandHandler("removebrandgroup", cmd_removebrandgroup))
     app.add_handler(CommandHandler("telethonlogin",    cmd_telethonlogin))
     app.add_handler(CommandHandler("telethoncode",     cmd_telethoncode))
     app.add_handler(CommandHandler("telethonpassword", cmd_telethonpassword))
