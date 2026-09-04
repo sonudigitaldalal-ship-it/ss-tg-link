@@ -183,8 +183,41 @@ if not os.path.exists(KEYWORDS_FILE):
     save_alert_keywords(AUTO_ALERT_KEYWORDS)  # pehli baar file bana do
 
 alerted_plan_keywords = set()  # (plan, keyword) pairs jinke liye already alert ja chuka hai
+alerted_links = set()          # keyword-mode ke liye — links jinke liye already alert ja chuka hai
 IST          = timezone(timedelta(hours=5, minutes=30))
 PLANS        = {"A": PLAN_A, "B": PLAN_B, "C": PLAN_C}
+
+# ─────────────────────────────────────────────
+#  Auto-Alert MODE — do modes, ek time pe sirf ek active
+#  "plan"    → keyword ek POORE PLAN ke saare channels mein aana chahiye
+#  "keyword" → SAME LINK kam se kam AUTO_ALERT_MIN_CHANNELS_LINK channels
+#              mein post hona chahiye (plan se independent)
+#  /setmode plan  ya  /setmode keyword  se switch karo, /mode se current dekho
+# ─────────────────────────────────────────────
+AUTO_ALERT_MIN_CHANNELS_LINK = 2
+MODE_FILE = os.environ.get("MODE_FILE", "/data/alert_mode.txt")
+URL_REGEX = re.compile(r"https?://\S+")
+
+def load_alert_mode():
+    try:
+        if os.path.exists(MODE_FILE):
+            with open(MODE_FILE) as f:
+                m = f.read().strip()
+                if m in ("plan", "keyword"):
+                    return m
+    except Exception as e:
+        log.error(f"load_alert_mode: {e}")
+    return "plan"
+
+def save_alert_mode(mode):
+    try:
+        os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
+        with open(MODE_FILE, "w") as f:
+            f.write(mode)
+    except Exception as e:
+        log.error(f"save_alert_mode: {e}")
+
+AUTO_ALERT_MODE = load_alert_mode()
 
 # ─────────────────────────────────────────────
 #  BRAND → WhatsApp Group mapping
@@ -495,10 +528,7 @@ def register_telethon_handlers(client):
             db_save_message(chat.id, title, username or "", event.message.id, event.message.text, event.message.date)
             asyncio.create_task(telethon_refresh_photo(client, chat.id, title))
 
-            text_lower = event.message.text.lower()
-            matched = [kw for kw in AUTO_ALERT_KEYWORDS if kw.lower() in text_lower]
-            for kw in matched:
-                asyncio.create_task(check_plan_full_coverage(kw))
+            dispatch_auto_alert(event.message.text)
         except Exception as e:
             log.error(f"Telethon message handler error: {e}", exc_info=True)
 
@@ -582,6 +612,62 @@ async def check_plan_full_coverage(keyword: str):
             log.error(f"Plan auto-alert failed for Plan {plan_name}: {e}", exc_info=True)
 
 
+async def check_link_multi_channel(link: str):
+    """KEYWORD MODE: agar ye link kam se kam AUTO_ALERT_MIN_CHANNELS_LINK
+    channels mein mil chuka hai (last AUTO_ALERT_WINDOW_MINUTES mein),
+    saare authorized users ko screenshot bhej do. Plan se independent —
+    saare known channels ke across kaam karta hai."""
+    if link in alerted_links:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_ALERT_WINDOW_MINUTES)
+    rows = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: db_search_any_channel(link, cutoff)
+    )
+    if len(rows) < AUTO_ALERT_MIN_CHANNELS_LINK:
+        return
+
+    alerted_links.add(link)
+
+    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    results = []
+    for chat_id, chat_title, username, message_id, msg_text, date_utc in rows:
+        dt = datetime.fromisoformat(date_utc)
+        post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+        _, photo_b64 = known.get((chat_title or "").lower(), (None, ""))
+        results.append({
+            "channel": chat_title or "Unknown", "time": to_ist(dt),
+            "text": msg_text, "link": post_link, "photo_b64": photo_b64, "found": True,
+        })
+
+    try:
+        png_bytes = await make_screenshot(results, link, "🔗")
+        caption = (f"🔗 *Same link {len(results)} channels mein mila!*\n\n" +
+                   "\n".join(r["link"] for r in results))[:1020]
+        img_b64 = base64.b64encode(png_bytes).decode()
+        kb = build_all_group_buttons(img_b64, caption.strip()[:900])
+        for uid in YOUR_USER_ID:
+            await bot_instance.send_photo(
+                chat_id=uid, photo=BytesIO(png_bytes),
+                caption=caption[:1020], parse_mode="Markdown", reply_markup=kb,
+            )
+    except Exception as e:
+        log.error(f"Link-mode auto-alert failed: {e}", exc_info=True)
+
+
+def dispatch_auto_alert(text: str):
+    """Current AUTO_ALERT_MODE ke hisaab se sahi checker ko trigger karta hai."""
+    if AUTO_ALERT_MODE == "plan":
+        text_lower = text.lower()
+        matched = [kw for kw in AUTO_ALERT_KEYWORDS if kw.lower() in text_lower]
+        for kw in matched:
+            asyncio.create_task(check_plan_full_coverage(kw))
+    else:  # "keyword" mode — link-based
+        urls = URL_REGEX.findall(text)
+        if urls:
+            asyncio.create_task(check_link_multi_channel(urls[0]))
+
+
 async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     if not msg or not msg.text:
@@ -590,10 +676,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_save_message(chat.id, chat.title or "", chat.username or "", msg.message_id, msg.text, msg.date)
     asyncio.create_task(refresh_photo_if_needed(chat.id, chat.title or ""))
 
-    text_lower = msg.text.lower()
-    matched = [kw for kw in AUTO_ALERT_KEYWORDS if kw.lower() in text_lower]
-    for kw in matched:
-        asyncio.create_task(check_plan_full_coverage(kw))
+    dispatch_auto_alert(msg.text)
 
 # ── HTML builder ──────────────────────────────
 
@@ -799,6 +882,8 @@ def start_text() -> str:
         "⏱ /olddeal loot 15/8 7:00pm — Purani history search (Telethon chahiye)\n"
         "🔄 /backfill [din] — Pichla data DB mein fetch karo (default 3 din)\n"
         "📊 /telethonchannels — Kitne channels/groups mein Telethon member hai\n"
+        "🔀 /setmode plan|keyword — Auto-alert mode badlo\n"
+        "📍 /mode — Current auto-alert mode dekho\n"
         "❓ /help — Show this message\n\n"
         "*Examples:*\n"
         "`/a iPhone`\n"
@@ -1411,6 +1496,30 @@ async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(run_backfill(update.effective_chat.id, days))
 
 
+async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_ALERT_MODE
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not context.args or context.args[0].lower() not in ("plan", "keyword"):
+        return await update.message.reply_text(
+            "⚠️ Usage: `/setmode plan` ya `/setmode keyword`\n\n"
+            "*plan* — keyword poore Plan (A/B/C) ke saare channels mein aana chahiye\n"
+            "*keyword* — same LINK kam se kam "
+            f"{AUTO_ALERT_MIN_CHANNELS_LINK} channels mein post hona chahiye",
+            parse_mode="Markdown"
+        )
+    AUTO_ALERT_MODE = context.args[0].lower()
+    save_alert_mode(AUTO_ALERT_MODE)
+    await update.message.reply_text(f"✅ Auto-Alert mode ab *{AUTO_ALERT_MODE}* hai.", parse_mode="Markdown")
+
+async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    desc = ("Plan ke saare channels mein keyword aana chahiye" if AUTO_ALERT_MODE == "plan"
+            else f"Same link kam se kam {AUTO_ALERT_MIN_CHANNELS_LINK} channels mein aana chahiye")
+    await update.message.reply_text(f"📍 Current mode: *{AUTO_ALERT_MODE}*\n({desc})", parse_mode="Markdown")
+
+
 async def cmd_telethonchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telethon account jitne channels/groups mein member hai, unka count + list dikhata hai."""
     user_id = update.effective_user.id
@@ -1586,6 +1695,8 @@ async def main():
     app.add_handler(CommandHandler("olddeal", cmd_olddeal))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CommandHandler("telethonchannels", cmd_telethonchannels))
+    app.add_handler(CommandHandler("setmode", cmd_setmode))
+    app.add_handler(CommandHandler("mode",    cmd_mode))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # This is the key piece — listens for new posts in any channel the bot is admin of
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
