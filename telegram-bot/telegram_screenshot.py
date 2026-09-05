@@ -606,10 +606,39 @@ def register_telethon_handlers(client):
 
 # ── Channel post listener — this is what replaces Telethon ────
 
+import difflib
+
+def extract_deal_title(text: str) -> str:
+    """Deal ka 'title' nikalta hai — first line, aur agar '@' (price marker) hai
+    toh usse pehle tak ka hissa. Jaise 'Loot Fast (Pack of 3) @199.' se
+    'Loot Fast (Pack of 3)' milega."""
+    first_line = text.strip().split("\n")[0].strip()
+    if "@" in first_line:
+        first_line = first_line.split("@")[0].strip()
+    return first_line
+
+def titles_match(title_a: str, title_b: str, min_ratio: float = 0.90) -> bool:
+    """Do titles 'same deal' hain ya nahi — pehle 2 words EXACT match hone
+    chahiye, aur poore title mein kam se kam min_ratio (default 90%) similarity."""
+    a, b = title_a.strip().lower(), title_b.strip().lower()
+    if not a or not b:
+        return False
+    words_a, words_b = a.split(), b.split()
+    if len(words_a) >= 2 and len(words_b) >= 2:
+        if words_a[:2] != words_b[:2]:
+            return False
+    else:
+        if a != b:
+            return False
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return ratio >= min_ratio
+
+
 async def check_plan_full_coverage(keyword: str):
     """Agar ye keyword/brand kisi Plan ke SAARE channels mein mil chuka hai
-    (last AUTO_ALERT_WINDOW_MINUTES mein), us plan ka poora screenshot
-    generate karke saare authorized users ko bhej do."""
+    (last AUTO_ALERT_WINDOW_MINUTES mein) — AUR wo asal mein SAME DEAL hai
+    (title ke pehle 2 words exact + 90%+ similarity), us plan ka poora
+    screenshot generate karke saare authorized users ko bhej do."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_ALERT_WINDOW_MINUTES)
     rows = await asyncio.get_event_loop().run_in_executor(
         None, lambda: db_search_any_channel(keyword, cutoff)
@@ -617,89 +646,106 @@ async def check_plan_full_coverage(keyword: str):
     if not rows:
         return
 
-    matched_titles_lower = {(row[1] or "").lower() for row in rows}
     known = get_known_channels_map()
-    rows_by_title = {(row[1] or "").lower(): row for row in rows}
 
-    for plan_name, plan_channels in PLANS.items():
-        plan_names_lower = {ch[0].lower() for ch in plan_channels}
-        if not plan_names_lower.issubset(matched_titles_lower):
-            continue  # is plan ke saare channels mein abhi tak nahi aaya
+    # Rows ko "same deal" clusters mein group karo — sirf title-match wale
+    # channels hi ek saath count honge, keyword sirf ek loose pre-filter hai.
+    clusters = []  # [{"title": str, "rows": [row, ...]}, ...]
+    for row in rows:
+        title = extract_deal_title(row[4])  # row[4] = msg_text
+        placed = False
+        for cluster in clusters:
+            if titles_match(cluster["title"], title):
+                cluster["rows"].append(row)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"title": title, "rows": [row]})
 
-        key = (plan_name, keyword.lower())
-        if key in alerted_plan_keywords:
-            continue  # is plan ke liye is keyword pe pehle hi alert bhej chuke hain
-        alerted_plan_keywords.add(key)
+    for cluster in clusters:
+        rows_by_title = {(r[1] or "").lower(): r for r in cluster["rows"]}
+        matched_titles_lower = set(rows_by_title.keys())
 
-        results = []
-        for ch_name, ch_link in plan_channels:
-            row = rows_by_title.get(ch_name.lower())
-            _, photo_b64 = known.get(ch_name.lower(), (None, ""))
-            if row:
-                chat_id, chat_title, username, message_id, msg_text, date_utc = row
-                dt = datetime.fromisoformat(date_utc)
-                post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
-                results.append({
-                    "channel": ch_name, "time": to_ist(dt), "text": msg_text,
-                    "link": post_link, "photo_b64": photo_b64, "found": True,
-                })
-            else:
-                results.append({"channel": ch_name, "found": False, "photo_b64": photo_b64})
+        for plan_name, plan_channels in PLANS.items():
+            plan_names_lower = {ch[0].lower() for ch in plan_channels}
+            if not plan_names_lower.issubset(matched_titles_lower):
+                continue  # is plan ke saare channels mein ye SAME deal abhi tak nahi aaya
 
-        try:
-            png_bytes = await make_screenshot(results, keyword, plan_name)
-            caption = (f"🔥 *Plan {plan_name} mein '{keyword}' poore plan mein mila!* "
-                       f"Sab {len(plan_channels)} channels mein aaya:\n\n" +
-                       "\n".join(r["link"] for r in results if r.get("found")))[:1020]
-            img_b64 = base64.b64encode(png_bytes).decode()
-            wa_grp = plan_wa_groups.get(plan_name)
+            key = (plan_name, keyword.lower(), cluster["title"].lower())
+            if key in alerted_plan_keywords:
+                continue  # is plan ke liye is exact deal pe pehle hi alert bhej chuke hain
+            alerted_plan_keywords.add(key)
 
-            if wa_grp and WA_API_URL:
-                # Seedha WhatsApp group mein bhej do — button dabana nahi padega
-                wa_caption = caption.strip()[:900]
-                res = wa_send_image(wa_grp['id'], img_b64, wa_caption)
-                if res.get('success'):
-                    del_id = f'wd_{uuid.uuid4().hex[:8]}'
-                    sent_wa[del_id] = {'key': res['key'], 'group_id': wa_grp['id']}
-                    threading.Timer(600, lambda: sent_wa.pop(del_id, None)).start()
-                    tg_caption = f"✅ *Auto-sent to {wa_grp['name']}!*\n\n{caption[:850]}"
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=del_id)
-                    ]])
+            results = []
+            for ch_name, ch_link in plan_channels:
+                row = rows_by_title.get(ch_name.lower())
+                _, photo_b64 = known.get(ch_name.lower(), (None, ""))
+                if row:
+                    chat_id, chat_title, username, message_id, msg_text, date_utc = row
+                    dt = datetime.fromisoformat(date_utc)
+                    post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+                    results.append({
+                        "channel": ch_name, "time": to_ist(dt), "text": msg_text,
+                        "link": post_link, "photo_b64": photo_b64, "found": True,
+                    })
                 else:
-                    tg_caption = f"⚠️ WhatsApp send fail hua ({res.get('error', 'unknown')}):\n\n{caption[:850]}"
+                    results.append({"channel": ch_name, "found": False, "photo_b64": photo_b64})
+
+            try:
+                png_bytes = await make_screenshot(results, keyword, plan_name)
+                links_only = "\n".join(r["link"] for r in results if r.get("found"))
+                caption = (f"🔥 *Plan {plan_name} mein '{cluster['title']}' poore plan mein mila!* "
+                           f"Sab {len(plan_channels)} channels mein aaya:\n\n" + links_only)[:1020]
+                img_b64 = base64.b64encode(png_bytes).decode()
+                wa_grp = plan_wa_groups.get(plan_name)
+
+                if wa_grp and WA_API_URL:
+                    # WhatsApp pe sirf links jaate hain — bot-internal info line (Plan/keyword
+                    # naam) sirf Telegram tak hi rehti hai, customers ko wo nahi dikhni chahiye
+                    wa_caption = links_only[:900]
+                    res = wa_send_image(wa_grp['id'], img_b64, wa_caption)
+                    if res.get('success'):
+                        del_id = f'wd_{uuid.uuid4().hex[:8]}'
+                        sent_wa[del_id] = {'key': res['key'], 'group_id': wa_grp['id']}
+                        threading.Timer(600, lambda: sent_wa.pop(del_id, None)).start()
+                        tg_caption = f"✅ *Auto-sent to {wa_grp['name']}!*\n\n{caption[:850]}"
+                        kb = InlineKeyboardMarkup([[
+                            InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=del_id)
+                        ]])
+                    else:
+                        tg_caption = f"⚠️ WhatsApp send fail hua ({res.get('error', 'unknown')}):\n\n{caption[:850]}"
+                        kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan_name, plan_wa_grp=wa_grp)
+                else:
+                    tg_caption = caption[:900]
                     kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan_name, plan_wa_grp=wa_grp)
-            else:
-                tg_caption = caption[:900]
-                kb = build_send_buttons(keyword, img_b64, caption.strip()[:900], plan=plan_name, plan_wa_grp=wa_grp)
 
-            for uid in YOUR_USER_ID:
-                await bot_instance.send_photo(
-                    chat_id=uid, photo=BytesIO(png_bytes),
-                    caption=tg_caption[:1020], parse_mode="Markdown", reply_markup=kb,
-                )
+                for uid in YOUR_USER_ID:
+                    await bot_instance.send_photo(
+                        chat_id=uid, photo=BytesIO(png_bytes),
+                        caption=tg_caption[:1020], parse_mode="Markdown", reply_markup=kb,
+                    )
 
-            # Brand-specific group mein bhi auto-send karo agar keyword kisi brand se match kare
-            brand, brand_grp = find_brand_for_keyword(keyword)
-            if brand and brand_grp and WA_API_URL:
-                brand_res = wa_send_image(brand_grp['id'], img_b64, caption.strip()[:900])
-                if brand_res.get('success'):
-                    brand_del_id = f'wd_{uuid.uuid4().hex[:8]}'
-                    sent_wa[brand_del_id] = {'key': brand_res['key'], 'group_id': brand_grp['id']}
-                    threading.Timer(600, lambda: sent_wa.pop(brand_del_id, None)).start()
-                    brand_kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=brand_del_id)
-                    ]])
-                    for uid in YOUR_USER_ID:
-                        await bot_instance.send_message(
-                            chat_id=uid,
-                            text=f"✅ *Brand match!* '{keyword}' → *{brand_grp['name']}* mein bhi auto-sent!",
-                            parse_mode="Markdown", reply_markup=brand_kb,
-                        )
-                else:
-                    log.warning(f"Brand auto-send failed for {brand}: {brand_res.get('error')}")
-        except Exception as e:
-            log.error(f"Plan auto-alert failed for Plan {plan_name}: {e}", exc_info=True)
+                # Brand-specific group mein bhi auto-send karo agar keyword kisi brand se match kare
+                brand, brand_grp = find_brand_for_keyword(keyword)
+                if brand and brand_grp and WA_API_URL:
+                    brand_res = wa_send_image(brand_grp['id'], img_b64, links_only[:900])
+                    if brand_res.get('success'):
+                        brand_del_id = f'wd_{uuid.uuid4().hex[:8]}'
+                        sent_wa[brand_del_id] = {'key': brand_res['key'], 'group_id': brand_grp['id']}
+                        threading.Timer(600, lambda: sent_wa.pop(brand_del_id, None)).start()
+                        brand_kb = InlineKeyboardMarkup([[
+                            InlineKeyboardButton('🗑️ Delete from WhatsApp', callback_data=brand_del_id)
+                        ]])
+                        for uid in YOUR_USER_ID:
+                            await bot_instance.send_message(
+                                chat_id=uid,
+                                text=f"✅ *Brand match!* '{keyword}' → *{brand_grp['name']}* mein bhi auto-sent!",
+                                parse_mode="Markdown", reply_markup=brand_kb,
+                            )
+                    else:
+                        log.warning(f"Brand auto-send failed for {brand}: {brand_res.get('error')}")
+            except Exception as e:
+                log.error(f"Plan auto-alert failed for Plan {plan_name}: {e}", exc_info=True)
 
 
 async def check_link_multi_channel(link: str):
@@ -732,10 +778,10 @@ async def check_link_multi_channel(link: str):
 
     try:
         png_bytes = await make_screenshot(results, link, "🔗")
-        caption = (f"🔗 *Same link {len(results)} channels mein mila!*\n\n" +
-                   "\n".join(r["link"] for r in results))[:1020]
+        links_only = "\n".join(r["link"] for r in results)
+        caption = (f"🔗 *Same link {len(results)} channels mein mila!*\n\n" + links_only)[:1020]
         img_b64 = base64.b64encode(png_bytes).decode()
-        kb = build_all_group_buttons(img_b64, caption.strip()[:900])
+        kb = build_all_group_buttons(img_b64, links_only[:900])
         for uid in YOUR_USER_ID:
             await bot_instance.send_photo(
                 chat_id=uid, photo=BytesIO(png_bytes),
@@ -748,7 +794,7 @@ async def check_link_multi_channel(link: str):
         combined_text = " ".join(r.get("text", "") for r in results)
         brand, brand_grp = find_brand_for_keyword(combined_text)
         if brand and brand_grp and WA_API_URL:
-            brand_res = wa_send_image(brand_grp['id'], img_b64, caption.strip()[:900])
+            brand_res = wa_send_image(brand_grp['id'], img_b64, links_only[:900])
             if brand_res.get('success'):
                 brand_del_id = f'wd_{uuid.uuid4().hex[:8]}'
                 sent_wa[brand_del_id] = {'key': brand_res['key'], 'group_id': brand_grp['id']}
