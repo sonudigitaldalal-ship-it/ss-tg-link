@@ -311,6 +311,18 @@ def db_get_known_channels():
     conn.close()
     return rows
 
+def get_known_channels_map():
+    """{title_lower: (username, photo_b64)} banata hai — agar (purane bug se bache) duplicate
+    title wale rows ho bhi, toh jisme photo hai wahi priority leta hai."""
+    result = {}
+    for chat_id, title, username, photo in db_get_known_channels():
+        if not title:
+            continue
+        key = title.lower()
+        if key not in result or (photo and not result[key][1]):
+            result[key] = (username, photo)
+    return result
+
 DATA_RETENTION_DAYS = 15  # isse purane messages auto-delete ho jate hain (DB chhoti aur fast rehti hai)
 
 def db_cleanup_old_data(days: int = DATA_RETENTION_DAYS) -> int:
@@ -322,6 +334,46 @@ def db_cleanup_old_data(days: int = DATA_RETENTION_DAYS) -> int:
     conn.commit()
     conn.close()
     return deleted
+
+
+def db_dedupe_channels() -> int:
+    """PURANI wale bug (Bot API + Telethon alag chat_id format) se bane duplicate
+    channel entries ko merge karta hai — same title wale channels ko ek chat_id
+    mein consolidate karta hai (jisme photo hai use canonical rakhta hai)."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT chat_id, chat_title, photo_b64 FROM channels").fetchall()
+
+    by_title = {}
+    for chat_id, title, photo in rows:
+        key = (title or "").lower()
+        if not key:
+            continue
+        by_title.setdefault(key, []).append((chat_id, photo))
+
+    merged = 0
+    for key, entries in by_title.items():
+        if len(entries) <= 1:
+            continue
+        canonical = next((e for e in entries if e[1]), entries[0])
+        canonical_id = canonical[0]
+        canonical_photo = canonical[1]
+
+        for chat_id, photo in entries:
+            if chat_id == canonical_id:
+                continue
+            # Is duplicate channel ke messages canonical id mein migrate karo
+            # (agar wahi message_id canonical mein already hai toh IGNORE ho jayega)
+            conn.execute("UPDATE OR IGNORE messages SET chat_id=? WHERE chat_id=?", (canonical_id, chat_id))
+            conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))  # baaki bacha hua hata do
+            conn.execute("DELETE FROM channels WHERE chat_id=?", (chat_id,))
+            if not canonical_photo and photo:
+                conn.execute("UPDATE channels SET photo_b64=? WHERE chat_id=?", (photo, canonical_id))
+                canonical_photo = photo
+            merged += 1
+
+    conn.commit()
+    conn.close()
+    return merged
 
 
 async def cleanup_loop():
@@ -503,15 +555,26 @@ async def refresh_photo_if_needed(chat_id: int, chat_title: str):
 
 # ── Telethon hybrid listener (for channels where bot can't be admin) ─────
 
-async def telethon_refresh_photo(client, chat_id: int, chat_title: str):
+def telethon_to_bot_chat_id(entity) -> int:
+    """Telethon ka bare channel ID Bot-API-style (-100 prefixed) mein convert karta hai —
+    taaki wahi channel Bot API se bhi track ho raha ho toh database mein DUPLICATE entry
+    na bane (ek hi channel ke liye ek hi chat_id use ho, chahe kisi bhi listener se aaya ho)."""
+    is_channel = getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False)
+    raw_id = getattr(entity, "id", entity)
+    if is_channel:
+        return int(f"-100{raw_id}")
+    return raw_id
+
+
+async def telethon_refresh_photo(client, entity, db_chat_id: int, chat_title: str):
     known = {row[0]: row[3] for row in db_get_known_channels()}
-    if known.get(chat_id):
+    if known.get(db_chat_id):
         return
     try:
-        data = await client.download_profile_photo(chat_id, file=bytes)
+        data = await client.download_profile_photo(entity, file=bytes)
         if data:
             b64 = "data:image/jpeg;base64," + base64.b64encode(data).decode()
-            db_update_photo(chat_id, b64)
+            db_update_photo(db_chat_id, b64)
     except Exception as e:
         log.warning(f"Telethon photo fetch failed for {chat_title}: {e}")
 
@@ -530,9 +593,10 @@ def register_telethon_handlers(client):
             if not title:
                 return  # DMs, bots, waghera skip — sirf channels/groups chahiye
             username = getattr(chat, "username", None)
+            db_chat_id = telethon_to_bot_chat_id(chat)
 
-            db_save_message(chat.id, title, username or "", event.message.id, event.message.text, event.message.date)
-            asyncio.create_task(telethon_refresh_photo(client, chat.id, title))
+            db_save_message(db_chat_id, title, username or "", event.message.id, event.message.text, event.message.date)
+            asyncio.create_task(telethon_refresh_photo(client, chat, db_chat_id, title))
 
             dispatch_auto_alert(event.message.text)
         except Exception as e:
@@ -554,7 +618,7 @@ async def check_plan_full_coverage(keyword: str):
         return
 
     matched_titles_lower = {(row[1] or "").lower() for row in rows}
-    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    known = get_known_channels_map()
     rows_by_title = {(row[1] or "").lower(): row for row in rows}
 
     for plan_name, plan_channels in PLANS.items():
@@ -655,7 +719,7 @@ async def check_link_multi_channel(link: str):
 
     alerted_links.add(link)
 
-    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    known = get_known_channels_map()
     results = []
     for chat_id, chat_title, username, message_id, msg_text, date_utc in rows:
         dt = datetime.fromisoformat(date_utc)
@@ -882,7 +946,7 @@ async def make_screenshot(results: list, keyword: str, plan: str) -> bytes:
 
 def _search_sync(keyword: str, plan_channels: list) -> list:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SEARCH_HOURS)
-    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    known = get_known_channels_map()
 
     results = []
     for ch_name, ch_link in plan_channels:
@@ -1406,7 +1470,7 @@ async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         return await status.edit_text(f"⚠️ Telegram dialogs fetch karne mein error: {e}")
 
-    known_photos = {row[1].lower(): row[3] for row in db_get_known_channels() if row[1]}
+    known_photos_map = get_known_channels_map()
 
     results = []
     for ch_name in all_channels:
@@ -1425,14 +1489,14 @@ async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 post_link = f"https://t.me/{username}/{msg.id}" if username else f"https://t.me/c/{abs(entity.id)}/{msg.id}"
 
                 # Channel ka photo — pehle cache se, nahi to seedha Telethon se fetch karo
-                photo_b64 = known_photos.get(ch_name.lower(), "")
+                _, photo_b64 = known_photos_map.get(ch_name.lower(), (None, ""))
                 if not photo_b64:
                     try:
                         photo_bytes = await telethon_client.download_profile_photo(entity, file=bytes)
                         if photo_bytes:
                             photo_b64 = "data:image/jpeg;base64," + base64.b64encode(photo_bytes).decode()
-                            db_update_photo(entity.id, photo_b64)
-                            known_photos[ch_name.lower()] = photo_b64
+                            db_update_photo(telethon_to_bot_chat_id(entity), photo_b64)
+                            known_photos_map[ch_name.lower()] = (username, photo_b64)
                     except Exception as e:
                         log.warning(f"olddeal photo fetch failed for {ch_name}: {e}")
 
@@ -1471,7 +1535,7 @@ async def handle_direct_search(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=SEARCH_HOURS)
-    known = {row[1].lower(): (row[2], row[3]) for row in db_get_known_channels() if row[1]}
+    known = get_known_channels_map()
 
     rows = await asyncio.get_event_loop().run_in_executor(
         None, lambda: db_search_any_channel(text, cutoff)
@@ -1588,6 +1652,7 @@ async def run_backfill(chat_id_for_updates: int, days: int = 3):
         if not d.name or not (d.is_channel or d.is_group):
             continue
         entity = d.entity
+        db_chat_id = telethon_to_bot_chat_id(entity)
         try:
             async for msg in telethon_client.iter_messages(entity, offset_date=None, reverse=False, limit=500):
                 if msg.date < cutoff:
@@ -1595,7 +1660,7 @@ async def run_backfill(chat_id_for_updates: int, days: int = 3):
                 if not msg.text:
                     continue
                 username = getattr(entity, "username", None)
-                db_save_message(entity.id, d.name, username or "", msg.id, msg.text, msg.date)
+                db_save_message(db_chat_id, d.name, username or "", msg.id, msg.text, msg.date)
                 messages_saved += 1
         except Exception as e:
             log.warning(f"Backfill failed for {d.name}: {e}")
@@ -1610,6 +1675,17 @@ async def run_backfill(chat_id_for_updates: int, days: int = 3):
         )
     except Exception:
         pass
+
+
+async def cmd_cleanupduplicates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    status = await update.message.reply_text("🔄 Duplicate channel entries dhoondh raha hoon...")
+    merged = await asyncio.get_event_loop().run_in_executor(None, db_dedupe_channels)
+    if merged == 0:
+        await status.edit_text("✅ Koi duplicate nahi mila — database already clean hai.")
+    else:
+        await status.edit_text(f"✅ {merged} duplicate channel entries merge kar diye. Ab photos aur counts sahi aayenge.")
 
 
 async def cmd_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1829,12 +1905,14 @@ async def main():
     app.add_handler(CommandHandler("telethonpassword", cmd_telethonpassword))
     app.add_handler(CommandHandler("olddeal", cmd_olddeal))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
+    app.add_handler(CommandHandler("cleanupduplicates", cmd_cleanupduplicates))
     app.add_handler(CommandHandler("telethonchannels", cmd_telethonchannels))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("mode",    cmd_mode))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    # This is the key piece — listens for new posts in any channel the bot is admin of
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_post))
+    # Bot-API channel_post listener HATA diya — ab poori tarah Telethon hybrid listener
+    # hi saare channels track karta hai (duplicate-channel-ID bug ka permanent fix,
+    # aur admin banane ki zaroorat bhi nahi rahi, sirf member hona kaafi hai)
     # Merged from the old link-tracker bot — paste any link/keyword directly in private chat
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_direct_search))
 
