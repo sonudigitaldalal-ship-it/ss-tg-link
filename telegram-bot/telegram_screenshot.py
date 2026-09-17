@@ -103,11 +103,25 @@ SEARCH_HOURS = 12   # only search posts from last X hours
 
 # ── Hot-Deal Auto-Alert config ─────────────────────────
 # Jab bhi neeche wali list ka koi brand/keyword kisi Plan (A/B/C) ke SAARE
-# channels mein post ho jaye (AUTO_ALERT_WINDOW_MINUTES ke andar), bot khud
+# channels mein post ho jaye (apne-apne window ke andar), bot khud
 # us plan ka poora screenshot generate karke bhej dega. Link match nahi karta
 # (har channel apna alag affiliate link daalta hai) — sirf keyword/brand text
 # match karta hai, isliye zyada reliable hai.
-AUTO_ALERT_WINDOW_MINUTES = 15
+#
+# Har Plan ka apna alag window hai — jitne zyada channels, utna zyada time
+# deta hai unhe post karne ke liye (Plan A fast/kam-channel, C slow/zyada-channel).
+AUTO_ALERT_WINDOW_MINUTES = 15  # Plan A / fallback default
+PLAN_WINDOW_MINUTES = {"A": 15, "B": 25, "C": 35}
+
+# Kisi channel mein deal aaye toh us keyword ke liye SIRF wahi ek plan check
+# hoga (baaki 2 skip ho jayenge) — jab tak us plan ke SAARE channels post na
+# kar dein. Naam EXACT channel title se match hona chahiye (case-insensitive).
+TRIGGER_CHANNEL_PLAN = {
+    "alibaba loot deals": "C",
+    "rapid deals unlimited": "C",
+    "lallantop deals": "B",
+    "offer box official": "B",
+}
 
 # Ye sirf DEFAULT/starting list hai — pehli baar bot chalne par ye file mein
 # save ho jayegi. Uske baad /addkeyword, /removekeyword, /keywords commands
@@ -636,10 +650,12 @@ def titles_match(title_a: str, title_b: str, min_ratio: float = 0.90) -> bool:
 
 async def check_plan_full_coverage(keyword: str):
     """Agar ye keyword/brand kisi Plan ke SAARE channels mein mil chuka hai
-    (last AUTO_ALERT_WINDOW_MINUTES mein) — AUR wo asal mein SAME DEAL hai
-    (title ke pehle 2 words exact + 90%+ similarity), us plan ka poora
+    (us plan ke apne PLAN_WINDOW_MINUTES ke andar) — AUR wo asal mein SAME DEAL
+    hai (title ke pehle 2 words exact + 90%+ similarity), us plan ka poora
     screenshot generate karke saare authorized users ko bhej do."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=AUTO_ALERT_WINDOW_MINUTES)
+    now = datetime.now(timezone.utc)
+    broadest_minutes = max(PLAN_WINDOW_MINUTES.values())
+    cutoff = now - timedelta(minutes=broadest_minutes)
     rows = await asyncio.get_event_loop().run_in_executor(
         None, lambda: db_search_any_channel(keyword, cutoff)
     )
@@ -663,13 +679,26 @@ async def check_plan_full_coverage(keyword: str):
             clusters.append({"title": title, "rows": [row]})
 
     for cluster in clusters:
-        rows_by_title = {(r[1] or "").lower(): r for r in cluster["rows"]}
-        matched_titles_lower = set(rows_by_title.keys())
+        # Agar is cluster (deal) ke channels mein koi "trigger channel" hai,
+        # toh sirf uska mapped plan hi check hoga — baaki 2 skip.
+        cluster_titles_lower = {(r[1] or "").lower() for r in cluster["rows"]}
+        forced_plan = None
+        for trig_channel, trig_plan in TRIGGER_CHANNEL_PLAN.items():
+            if trig_channel in cluster_titles_lower:
+                forced_plan = trig_plan
+                break
+        plans_to_check = {forced_plan: PLANS[forced_plan]} if forced_plan else PLANS
 
-        for plan_name, plan_channels in PLANS.items():
+        for plan_name, plan_channels in plans_to_check.items():
+            # Is plan ka apna window — sirf usi window ke andar wale rows count honge
+            plan_cutoff = now - timedelta(minutes=PLAN_WINDOW_MINUTES.get(plan_name, AUTO_ALERT_WINDOW_MINUTES))
+            plan_rows = [r for r in cluster["rows"] if datetime.fromisoformat(r[5]) >= plan_cutoff]
+            rows_by_title = {(r[1] or "").lower(): r for r in plan_rows}
+            matched_titles_lower = set(rows_by_title.keys())
+
             plan_names_lower = {ch[0].lower() for ch in plan_channels}
             if not plan_names_lower.issubset(matched_titles_lower):
-                continue  # is plan ke saare channels mein ye SAME deal abhi tak nahi aaya
+                continue  # is plan ke saare channels mein ye SAME deal (apne window mein) abhi tak nahi aaya
 
             key = (plan_name, keyword.lower(), cluster["title"].lower())
             if key in alerted_plan_keywords:
@@ -1712,6 +1741,7 @@ async def run_backfill(chat_id_for_updates: int, days: int = 3):
             log.warning(f"Backfill failed for {d.name}: {e}")
             continue
         channels_done += 1
+        await telethon_refresh_photo(telethon_client, entity, db_chat_id, d.name)
 
     try:
         await bot_instance.send_message(
@@ -1721,6 +1751,34 @@ async def run_backfill(chat_id_for_updates: int, days: int = 3):
         )
     except Exception:
         pass
+
+
+async def cmd_refreshphotos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Jitne channels bhi DB mein hain, unke photos check/fetch karta hai —
+    backfill ke baad ya kisi bhi waqt manually run kar sakte ho."""
+    if update.effective_user.id not in YOUR_USER_ID:
+        return await update.message.reply_text("⛔ Unauthorised.")
+    if not telethon_client or not (await telethon_client.is_user_authorized()):
+        return await update.message.reply_text("❌ Pehle /telethonlogin karo.")
+
+    status = await update.message.reply_text("🔄 Photos check/fetch ho rahe hain, thodi der lagegi...")
+    try:
+        dialogs = await telethon_client.get_dialogs()
+    except Exception as e:
+        return await status.edit_text(f"⚠️ Error: {e}")
+
+    count = 0
+    for d in dialogs:
+        if not d.name or not (d.is_channel or d.is_group):
+            continue
+        db_chat_id = telethon_to_bot_chat_id(d.entity)
+        try:
+            await telethon_refresh_photo(telethon_client, d.entity, db_chat_id, d.name)
+        except Exception as e:
+            log.warning(f"refreshphotos failed for {d.name}: {e}")
+        count += 1
+
+    await status.edit_text(f"✅ {count} channels/groups ke photos check/fetch ho gaye.")
 
 
 async def cmd_cleanupduplicates(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1952,6 +2010,7 @@ async def main():
     app.add_handler(CommandHandler("olddeal", cmd_olddeal))
     app.add_handler(CommandHandler("backfill", cmd_backfill))
     app.add_handler(CommandHandler("cleanupduplicates", cmd_cleanupduplicates))
+    app.add_handler(CommandHandler("refreshphotos", cmd_refreshphotos))
     app.add_handler(CommandHandler("telethonchannels", cmd_telethonchannels))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("mode",    cmd_mode))
