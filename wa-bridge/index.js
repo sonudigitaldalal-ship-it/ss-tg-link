@@ -12,7 +12,6 @@
  *   POST /delete           -> delete a previously sent message
  *   GET  /qr               -> QR code page (fallback, QR is also pushed to Telegram)
  *   GET  /status            -> connection status
- *   GET  /debug-chats-open  -> TEMP: list all chats, no auth (for diagnosing)
  *
  * /groups, /send, /delete need an 'x-api-key' header matching WA_API_KEY.
  */
@@ -145,7 +144,9 @@ async function startSocket() {
       console.log(`⚠️ WhatsApp disconnect ho gaya (loggedOut=${loggedOut}, code=${statusCode})`);
       if (loggedOut) {
         lastQrSentAt = 0;
-        notifyTelegram("⚠️ WhatsApp session logout ho gaya. Naya QR generate hoga jab dobara start hoga.");
+        notifyTelegram("⚠️ WhatsApp session logout ho gaya (phone se linked device hata ya WhatsApp ne invalidate kiya). Naya QR abhi bana raha hu, /qr se scan karo.");
+        try { require("fs").rmSync(SESSION_PATH, { recursive: true, force: true }); } catch (e) { console.log("auth clear fail:", e.message); }
+        setTimeout(startSocket, 3000);
       } else {
         console.log("🔄 Reconnecting...");
         setTimeout(startSocket, 3000);
@@ -210,18 +211,6 @@ app.get("/groups", checkApiKey, async (req, res) => {
     const all = await sock.groupFetchAllParticipating();
     const groups = Object.values(all).map((g) => ({ id: g.id, name: g.subject }));
     res.json({ groups });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// TEMPORARY — bina API key ke, diagnosing ke liye. Baad mein hata dena.
-app.get("/debug-chats-open", async (req, res) => {
-  if (!isReady) return res.status(503).json({ success: false, error: "WhatsApp abhi ready nahi hai" });
-  try {
-    const all = await sock.groupFetchAllParticipating();
-    const groups = Object.values(all).map((g) => ({ id: g.id, name: g.subject, isGroup: true }));
-    res.json({ total: groups.length, chats: groups });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
