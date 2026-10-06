@@ -273,6 +273,16 @@ def find_brand_for_keyword(keyword: str):
 # ─────────────────────────────────────────────
 #  DATABASE — stores every channel post the bot sees, once added as admin
 # ─────────────────────────────────────────────
+def post_url(username, chat_id, message_id):
+    """Public channel -> t.me/username/id ; private -> t.me/c/<bare id>/id (-100 prefix hata kar)."""
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    raw = str(abs(int(chat_id)))
+    if raw.startswith("100") and len(raw) > 10:
+        raw = raw[3:]
+    return f"https://t.me/c/{raw}/{message_id}"
+
+
 DB_PATH = os.environ.get("DB_PATH", "/data/messages.db")
 
 def db_init():
@@ -712,7 +722,7 @@ async def check_plan_full_coverage(keyword: str):
                 if row:
                     chat_id, chat_title, username, message_id, msg_text, date_utc = row
                     dt = datetime.fromisoformat(date_utc)
-                    post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+                    post_link = post_url(username, chat_id, message_id)
                     results.append({
                         "channel": ch_name, "time": to_ist(dt), "text": msg_text,
                         "link": post_link, "photo_b64": photo_b64, "found": True,
@@ -798,7 +808,7 @@ async def check_link_multi_channel(link: str):
     results = []
     for chat_id, chat_title, username, message_id, msg_text, date_utc in rows:
         dt = datetime.fromisoformat(date_utc)
-        post_link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+        post_link = post_url(username, chat_id, message_id)
         _, photo_b64 = known.get((chat_title or "").lower(), (None, ""))
         results.append({
             "channel": chat_title or "Unknown", "time": to_ist(dt),
@@ -1030,7 +1040,7 @@ def _search_sync(keyword: str, plan_channels: list) -> list:
         if row:
             chat_id, username, message_id, text, date_utc = row
             dt = datetime.fromisoformat(date_utc)
-            link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+            link = post_url(username, chat_id, message_id)
             results.append({
                 "channel":   ch_name,
                 "time":      to_ist(dt),
@@ -1561,7 +1571,7 @@ async def cmd_olddeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not msg.text or keyword.lower() not in msg.text.lower():
                     continue
                 username = getattr(entity, "username", None)
-                post_link = f"https://t.me/{username}/{msg.id}" if username else f"https://t.me/c/{abs(entity.id)}/{msg.id}"
+                post_link = post_url(username, entity.id, msg.id)
 
                 # Channel ka photo — pehle cache se, nahi to seedha Telethon se fetch karo
                 _, photo_b64 = known_photos_map.get(ch_name.lower(), (None, ""))
@@ -1626,7 +1636,7 @@ async def handle_direct_search(update: Update, context: ContextTypes.DEFAULT_TYP
     results = []
     for chat_id, chat_title, username, message_id, msg_text, date_utc in rows:
         dt = datetime.fromisoformat(date_utc)
-        link = f"https://t.me/{username}/{message_id}" if username else f"https://t.me/c/{abs(chat_id)}/{message_id}"
+        link = post_url(username, chat_id, message_id)
         _, photo_b64 = known.get((chat_title or "").lower(), (None, ""))
         results.append({
             "channel":   chat_title or "Unknown",
